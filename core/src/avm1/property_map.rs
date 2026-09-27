@@ -4,8 +4,8 @@
 //! the insertion order of properties, which is necessary for accurate
 //! enumeration order.
 
-use crate::string::{AvmString, WStr, utils as string_utils};
-use fnv::FnvBuildHasher;
+use crate::string::{AvmAtom, AvmString, WStr, utils as string_utils};
+use fnv::{FnvBuildHasher, FnvHashMap};
 use gc_arena::Collect;
 use indexmap::{Equivalent, IndexMap};
 use std::hash::{Hash, Hasher};
@@ -13,43 +13,69 @@ use std::hash::{Hash, Hasher};
 type FnvIndexMap<K, V> = IndexMap<K, V, FnvBuildHasher>;
 
 /// A map from property names to values.
-#[derive(Default, Clone, Debug, Collect)]
+#[derive(Clone, Debug, Collect)]
 #[collect(no_drop)]
-pub struct PropertyMap<'gc, V>(FnvIndexMap<PropertyName<'gc>, V>);
+pub struct PropertyMap<'gc, V> {
+    ordered: FnvIndexMap<PropertyName<'gc>, V>,
+    atom_index: FnvHashMap<AvmAtom<'gc>, usize>,
+}
+
+impl<V> Default for PropertyMap<'_, V> {
+    fn default() -> Self {
+        Self {
+            ordered: FnvIndexMap::default(),
+            atom_index: FnvHashMap::default(),
+        }
+    }
+}
 
 impl<'gc, V> PropertyMap<'gc, V> {
     pub fn new() -> Self {
-        Self(FnvIndexMap::default())
+        Self::default()
     }
 
     pub fn contains_key<T: AsRef<WStr>>(&self, key: T, case_sensitive: bool) -> bool {
         if case_sensitive {
-            self.0.contains_key(&CaseSensitive(key.as_ref()))
+            self.ordered.contains_key(&CaseSensitive(key.as_ref()))
         } else {
-            self.0.contains_key(&CaseInsensitive(key.as_ref()))
+            self.ordered.contains_key(&CaseInsensitive(key.as_ref()))
         }
+    }
+
+    #[inline]
+    pub fn contains_avm_string(&self, key: AvmString<'gc>, case_sensitive: bool) -> bool {
+        self.contains_key(key, case_sensitive)
+    }
+
+    #[inline]
+    pub fn contains_interned_key(&self, key: AvmAtom<'gc>) -> bool {
+        self.atom_index.contains_key(&key)
     }
 
     pub fn entry<'a>(&'a mut self, key: AvmString<'gc>, case_sensitive: bool) -> Entry<'gc, 'a, V> {
         if case_sensitive {
-            match self.0.get_index_of(&CaseSensitive(key.as_ref())) {
+            match self.ordered.get_index_of(&CaseSensitive(key.as_ref())) {
                 Some(index) => Entry::Occupied(OccupiedEntry {
-                    map: &mut self.0,
+                    map: &mut self.ordered,
+                    atom_index: &mut self.atom_index,
                     index,
                 }),
                 None => Entry::Vacant(VacantEntry {
-                    map: &mut self.0,
+                    map: &mut self.ordered,
+                    atom_index: &mut self.atom_index,
                     key,
                 }),
             }
         } else {
-            match self.0.get_index_of(&CaseInsensitive(key.as_ref())) {
+            match self.ordered.get_index_of(&CaseInsensitive(key.as_ref())) {
                 Some(index) => Entry::Occupied(OccupiedEntry {
-                    map: &mut self.0,
+                    map: &mut self.ordered,
+                    atom_index: &mut self.atom_index,
                     index,
                 }),
                 None => Entry::Vacant(VacantEntry {
-                    map: &mut self.0,
+                    map: &mut self.ordered,
+                    atom_index: &mut self.atom_index,
                     key,
                 }),
             }
@@ -59,24 +85,42 @@ impl<'gc, V> PropertyMap<'gc, V> {
     /// Gets the value for the specified property.
     pub fn get<T: AsRef<WStr>>(&self, key: T, case_sensitive: bool) -> Option<&V> {
         if case_sensitive {
-            self.0.get(&CaseSensitive(key.as_ref()))
+            self.ordered.get(&CaseSensitive(key.as_ref()))
         } else {
-            self.0.get(&CaseInsensitive(key.as_ref()))
+            self.ordered.get(&CaseInsensitive(key.as_ref()))
         }
+    }
+
+    #[inline]
+    pub fn get_avm_string(&self, key: AvmString<'gc>, case_sensitive: bool) -> Option<&V> {
+        self.get(key, case_sensitive)
+    }
+
+    #[inline]
+    pub fn get_interned(&self, key: AvmAtom<'gc>) -> Option<&V> {
+        self.atom_index
+            .get(&key)
+            .and_then(|&index| self.ordered.get_index(index).map(|(_, value)| value))
     }
 
     /// Gets a mutable reference to the value for the specified property.
     pub fn get_mut<T: AsRef<WStr>>(&mut self, key: T, case_sensitive: bool) -> Option<&mut V> {
         if case_sensitive {
-            self.0.get_mut(&CaseSensitive(key.as_ref()))
+            self.ordered.get_mut(&CaseSensitive(key.as_ref()))
         } else {
-            self.0.get_mut(&CaseInsensitive(key.as_ref()))
+            self.ordered.get_mut(&CaseInsensitive(key.as_ref()))
         }
+    }
+
+    #[inline]
+    pub fn get_interned_mut(&mut self, key: AvmAtom<'gc>) -> Option<&mut V> {
+        let index = *self.atom_index.get(&key)?;
+        self.ordered.get_index_mut(index).map(|(_, value)| value)
     }
 
     /// Gets a value by index, based on insertion order.
     pub fn get_index(&self, index: usize) -> Option<&V> {
-        self.0.get_index(index).map(|(_, v)| v)
+        self.ordered.get_index(index).map(|(_, v)| v)
     }
 
     pub fn insert(&mut self, key: AvmString<'gc>, value: V, case_sensitive: bool) -> Option<V> {
@@ -91,20 +135,20 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     /// Returns the value tuples in Flash's iteration order (most recently added first).
     pub fn iter(&self) -> impl Iterator<Item = (AvmString<'gc>, &V)> {
-        self.0.iter().rev().map(|(k, v)| (k.0, v))
+        self.ordered.iter().rev().map(|(k, v)| (k.0, v))
     }
 
     /// Returns the key-value tuples in Flash's iteration order (most recently added first).
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (AvmString<'gc>, &mut V)> {
-        self.0.iter_mut().rev().map(|(k, v)| (k.0, v))
+        self.ordered.iter_mut().rev().map(|(k, v)| (k.0, v))
     }
 
     pub fn remove<T: AsRef<WStr>>(&mut self, key: T, case_sensitive: bool) -> Option<V> {
         // Note that we must use shift_remove to maintain order in case this object is enumerated.
         if case_sensitive {
-            self.0.shift_remove(&CaseSensitive(key.as_ref()))
+            self.ordered.shift_remove(&CaseSensitive(key.as_ref()))
         } else {
-            self.0.shift_remove(&CaseInsensitive(key.as_ref()))
+            self.ordered.shift_remove(&CaseInsensitive(key.as_ref()))
         }
     }
 }
@@ -116,6 +160,7 @@ pub enum Entry<'gc, 'a, V> {
 
 pub struct OccupiedEntry<'gc, 'a, V> {
     map: &'a mut FnvIndexMap<PropertyName<'gc>, V>,
+    atom_index: &'a mut FnvHashMap<AvmAtom<'gc>, usize>,
     index: usize,
 }
 
@@ -140,6 +185,7 @@ impl<'gc, V> OccupiedEntry<'gc, '_, V> {
 
 pub struct VacantEntry<'gc, 'a, V> {
     map: &'a mut FnvIndexMap<PropertyName<'gc>, V>,
+    atom_index: &'a mut FnvHashMap<AvmAtom<'gc>, usize>,
     key: AvmString<'gc>,
 }
 

@@ -271,6 +271,12 @@ pub fn decode_define_bits_lossless(
     swf_tag: &swf::DefineBitsLossless,
 ) -> Result<Bitmap<'static>, Error> {
     // Decompress the image data (DEFLATE compression).
+    #[cfg(target_os = "vita")]
+    let mut decoded_data = decompress_zlib_exact(
+        &swf_tag.data,
+        lossless_decompressed_len(swf_tag)?,
+    )?;
+    #[cfg(not(target_os = "vita"))]
     let mut decoded_data = decompress_zlib(&swf_tag.data)?;
 
     let has_alpha = swf_tag.version == 2;
@@ -357,6 +363,134 @@ pub fn decode_define_bits_lossless(
         BitmapFormat::Rgba,
         out_data,
     ))
+}
+
+/// Decode a DefineBitsLossless tag directly into a caller-owned RGBA buffer.
+///
+/// The Vita BitmapData path uses this to avoid holding both the temporary
+/// decoded bitmap and a second Vec<Color> of the same size at once.
+#[cfg(target_os = "vita")]
+pub fn decode_define_bits_lossless_into_rgba(
+    swf_tag: &swf::DefineBitsLossless,
+    out: &mut [u8],
+) -> Result<(), Error> {
+    validate_size(swf_tag.width, swf_tag.height)?;
+    let pixel_len = (swf_tag.width as usize)
+        .checked_mul(swf_tag.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(Error::TooLarge)?;
+    if out.len() != pixel_len {
+        return Err(Error::TooLarge);
+    }
+
+    let has_alpha = swf_tag.version == 2;
+    match swf_tag.format {
+        swf::BitmapFormat::Rgb32 => {
+            decompress_zlib_exact_into(&swf_tag.data, out)?;
+            for rgba in out.as_chunks_mut::<4>().0 {
+                rgba.rotate_left(1);
+                if !has_alpha {
+                    rgba[3] = u8::MAX;
+                }
+            }
+        }
+        swf::BitmapFormat::Rgb15 => {
+            let padded_width = (swf_tag.width as usize + 1) & !1;
+            let decoded_len = padded_width
+                .checked_mul(swf_tag.height as usize)
+                .and_then(|pixels| pixels.checked_mul(2))
+                .ok_or(Error::TooLarge)?;
+            let decoded_data = decompress_zlib_exact(&swf_tag.data, decoded_len)?;
+            let mut src = 0usize;
+            let mut dst = 0usize;
+            for _ in 0..swf_tag.height {
+                for _ in 0..swf_tag.width {
+                    let compressed =
+                        u16::from_be_bytes([decoded_data[src], decoded_data[src + 1]]);
+                    let rgb5_component = |shift: u16| {
+                        let component = (compressed >> shift) & 0x1F;
+                        ((component * 255 + 15) / 31) as u8
+                    };
+                    out[dst..dst + 4].copy_from_slice(&[
+                        rgb5_component(10),
+                        rgb5_component(5),
+                        rgb5_component(0),
+                        u8::MAX,
+                    ]);
+                    src += 2;
+                    dst += 4;
+                }
+                src += (padded_width - swf_tag.width as usize) * 2;
+            }
+        }
+        swf::BitmapFormat::ColorMap8 { num_colors } => {
+            let decoded_len = lossless_decompressed_len(swf_tag)?;
+            let decoded_data = decompress_zlib_exact(&swf_tag.data, decoded_len)?;
+            let color_bytes = if has_alpha { 4usize } else { 3usize };
+            let color_count = num_colors as usize + 1;
+            let palette_len = color_count
+                .checked_mul(color_bytes)
+                .ok_or(Error::TooLarge)?;
+            let padded_width = (swf_tag.width as usize + 3) & !3;
+            let mut dst = 0usize;
+
+            for y in 0..swf_tag.height as usize {
+                let row = palette_len + y * padded_width;
+                for x in 0..swf_tag.width as usize {
+                    let entry = decoded_data[row + x] as usize;
+                    let palette = entry * color_bytes;
+                    let rgba = if entry < color_count {
+                        [
+                            decoded_data[palette],
+                            decoded_data[palette + 1],
+                            decoded_data[palette + 2],
+                            if has_alpha {
+                                decoded_data[palette + 3]
+                            } else {
+                                u8::MAX
+                            },
+                        ]
+                    } else if has_alpha {
+                        [0, 0, 0, 0]
+                    } else {
+                        [0, 0, 0, u8::MAX]
+                    };
+                    out[dst..dst + 4].copy_from_slice(&rgba);
+                    dst += 4;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "vita")]
+fn lossless_decompressed_len(swf_tag: &swf::DefineBitsLossless) -> Result<usize, Error> {
+    validate_size(swf_tag.width, swf_tag.height)?;
+
+    let width = swf_tag.width as usize;
+    let height = swf_tag.height as usize;
+    let size = match swf_tag.format {
+        swf::BitmapFormat::Rgb15 => {
+            let padded_width = (width + 1) & !1;
+            padded_width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(2))
+        }
+        swf::BitmapFormat::Rgb32 => width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4)),
+        swf::BitmapFormat::ColorMap8 { num_colors } => {
+            let color_bytes = if swf_tag.version == 2 { 4usize } else { 3usize };
+            let palette = (num_colors as usize + 1).checked_mul(color_bytes);
+            let padded_width = (width + 3) & !3;
+            let pixels = padded_width.checked_mul(height);
+            palette.and_then(|palette| pixels.and_then(|pixels| palette.checked_add(pixels)))
+        }
+    };
+
+    size.ok_or(Error::TooLarge)
 }
 
 fn decode_png_dimensions(data: &[u8]) -> Result<(u32, u32), Error> {
@@ -559,4 +693,53 @@ fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, Error> {
         .map_err(Error::InvalidZlibCompression)?;
     out_data.shrink_to_fit();
     Ok(out_data)
+}
+
+#[cfg(target_os = "vita")]
+fn decompress_zlib_exact(data: &[u8], expected_len: usize) -> Result<Vec<u8>, Error> {
+    let mut out_data = Vec::new();
+    out_data
+        .try_reserve_exact(expected_len)
+        .map_err(|_| Error::TooLarge)?;
+    out_data.resize(expected_len, 0);
+
+    let mut decoder = flate2::bufread::ZlibDecoder::new(data);
+    decoder
+        .read_exact(&mut out_data)
+        .map_err(Error::InvalidZlibCompression)?;
+
+    let mut extra = [0u8; 1];
+    if decoder
+        .read(&mut extra)
+        .map_err(Error::InvalidZlibCompression)?
+        != 0
+    {
+        return Err(Error::InvalidZlibCompression(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DefineBitsLossless decompressed beyond expected size",
+        )));
+    }
+
+    Ok(out_data)
+}
+
+#[cfg(target_os = "vita")]
+fn decompress_zlib_exact_into(data: &[u8], out: &mut [u8]) -> Result<(), Error> {
+    let mut decoder = flate2::bufread::ZlibDecoder::new(data);
+    decoder
+        .read_exact(out)
+        .map_err(Error::InvalidZlibCompression)?;
+
+    let mut extra = [0u8; 1];
+    if decoder
+        .read(&mut extra)
+        .map_err(Error::InvalidZlibCompression)?
+        != 0
+    {
+        return Err(Error::InvalidZlibCompression(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DefineBitsLossless decompressed beyond expected size",
+        )));
+    }
+    Ok(())
 }

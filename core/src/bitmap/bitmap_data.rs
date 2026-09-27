@@ -10,7 +10,10 @@ use ruffle_render::bitmap::{
 };
 use ruffle_wstr::WStr;
 use std::cell::Ref;
+#[cfg(target_os = "vita")]
+use std::ffi::c_void;
 use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
 use std::ops::Range;
 use swf::{Rectangle, Twips};
 use tracing::instrument;
@@ -188,6 +191,130 @@ impl From<Color> for u32 {
     }
 }
 
+enum BitmapPixels {
+    Owned(Vec<Color>),
+    #[cfg(target_os = "vita")]
+    Vita(VitaBitmapPixels),
+}
+
+impl BitmapPixels {
+    fn empty() -> Self {
+        Self::Owned(Vec::new())
+    }
+
+    fn from_vec(pixels: Vec<Color>) -> Self {
+        Self::Owned(pixels)
+    }
+
+    #[cfg(target_os = "vita")]
+    fn new_vita(len: usize) -> Option<Self> {
+        VitaBitmapPixels::new(len).map(Self::Vita)
+    }
+
+    #[cfg(target_os = "vita")]
+    fn rgba_mut(&mut self) -> &mut [u8] {
+        let colors = self.deref_mut();
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                colors.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(colors),
+            )
+        }
+    }
+}
+
+impl Clone for BitmapPixels {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Owned(pixels) => Self::Owned(pixels.clone()),
+            #[cfg(target_os = "vita")]
+            Self::Vita(pixels) => {
+                if let Some(mut clone) = VitaBitmapPixels::new(pixels.len) {
+                    clone.as_mut_slice().copy_from_slice(pixels.as_slice());
+                    Self::Vita(clone)
+                } else {
+                    Self::Owned(pixels.as_slice().to_vec())
+                }
+            }
+        }
+    }
+}
+
+impl Deref for BitmapPixels {
+    type Target = [Color];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(pixels) => pixels.as_slice(),
+            #[cfg(target_os = "vita")]
+            Self::Vita(pixels) => pixels.as_slice(),
+        }
+    }
+}
+
+impl DerefMut for BitmapPixels {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(pixels) => pixels.as_mut_slice(),
+            #[cfg(target_os = "vita")]
+            Self::Vita(pixels) => pixels.as_mut_slice(),
+        }
+    }
+}
+
+#[cfg(target_os = "vita")]
+struct VitaBitmapPixels {
+    ptr: *mut Color,
+    len: usize,
+}
+
+#[cfg(target_os = "vita")]
+impl VitaBitmapPixels {
+    fn new(len: usize) -> Option<Self> {
+        let bytes = len.checked_mul(std::mem::size_of::<Color>())?;
+        if bytes == 0 {
+            return Some(Self {
+                ptr: std::ptr::NonNull::<Color>::dangling().as_ptr(),
+                len: 0,
+            });
+        }
+
+        let ptr = unsafe { flashvita_vita_vgl_ram_alloc(bytes) }.cast::<Color>();
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, len);
+        }
+        Some(Self { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[Color] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [Color] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "vita")]
+impl Drop for VitaBitmapPixels {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            unsafe {
+                flashvita_vita_vgl_ram_free(self.ptr.cast());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "vita")]
+unsafe extern "C" {
+    fn flashvita_vita_vgl_ram_alloc(bytes: usize) -> *mut c_void;
+    fn flashvita_vita_vgl_ram_free(base: *mut c_void);
+}
+
 impl From<u32> for Color {
     fn from(i: u32) -> Self {
         Color::bgra_u32(i)
@@ -249,6 +376,29 @@ impl<'gc> BitmapData<'gc> {
         let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
 
         Self(data)
+    }
+
+    #[cfg(target_os = "vita")]
+    pub fn new_with_vita_rgba<F>(
+        mc: &Mutation<'gc>,
+        width: u32,
+        height: u32,
+        transparency: bool,
+        fill: F,
+    ) -> Result<Self, ruffle_render::error::Error>
+    where
+        F: FnOnce(&mut [u8]) -> Result<(), ruffle_render::error::Error>,
+    {
+        let pixel_count = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(ruffle_render::error::Error::TooLarge)?;
+        let mut pixels =
+            BitmapPixels::new_vita(pixel_count).ok_or(ruffle_render::error::Error::TooLarge)?;
+        fill(pixels.rgba_mut())?;
+
+        let data = BitmapRawData::new_with_storage(width, height, transparency, pixels);
+        let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
+        Ok(Self(data))
     }
 
     pub fn dummy(mc: &Mutation<'gc>) -> Self {
@@ -367,7 +517,7 @@ impl<'gc> BitmapData<'gc> {
 pub struct BitmapRawData<'gc> {
     /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
     #[collect(require_static)]
-    pixels: Vec<Color>,
+    pixels: BitmapPixels,
 
     width: u32,
     height: u32,
@@ -428,7 +578,7 @@ mod wrapper {
     use ruffle_render::commands::CommandHandler;
     use std::cell::Ref;
 
-    use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
+    use super::{BitmapPixels, BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
 
     /// A wrapper type that ensures that we always wait for a pending
     /// GPU -> CPU sync to complete (using `sync_handle`) before accessing
@@ -475,7 +625,7 @@ mod wrapper {
             BitmapRawDataWrapper(Gc::new(
                 mc,
                 BitmapRawData {
-                    pixels: Vec::new(),
+                    pixels: BitmapPixels::empty(),
                     width: 0,
                     height: 0,
                     transparency: false,
@@ -731,10 +881,10 @@ impl std::fmt::Debug for BitmapRawData<'_> {
 impl<'gc> BitmapRawData<'gc> {
     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
         Self {
-            pixels: vec![
+            pixels: BitmapPixels::from_vec(vec![
                 Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
                 width as usize * height as usize
-            ],
+            ]),
             width,
             height,
             transparency,
@@ -753,6 +903,20 @@ impl<'gc> BitmapRawData<'gc> {
         height: u32,
         transparency: bool,
         pixels: Vec<Color>,
+    ) -> Self {
+        Self::new_with_storage(
+            width,
+            height,
+            transparency,
+            BitmapPixels::from_vec(pixels),
+        )
+    }
+
+    fn new_with_storage(
+        width: u32,
+        height: u32,
+        transparency: bool,
+        pixels: BitmapPixels,
     ) -> Self {
         Self {
             pixels,
@@ -776,7 +940,7 @@ impl<'gc> BitmapRawData<'gc> {
     pub fn dispose(&mut self) {
         self.width = 0;
         self.height = 0;
-        self.pixels = Vec::new(); // free the CPU pixel buffer
+        self.pixels = BitmapPixels::empty(); // free the CPU pixel buffer
         self.bitmap_handle = None;
         // There's no longer a handle to update
         self.dirty_state = DirtyState::Clean;
@@ -899,7 +1063,7 @@ impl<'gc> BitmapRawData<'gc> {
         self.pixels[(x + y * self.width()) as usize]
     }
 
-    pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
+    pub fn raw_pixels_mut(&mut self) -> &mut [Color] {
         &mut self.pixels
     }
 

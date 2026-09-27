@@ -2373,6 +2373,15 @@ pub trait TDisplayObject<'gc>:
             //
             // Children added to buttons by the timeline do not emit events.
             if self.parent().and_then(|p| p.as_avm2_button()).is_none() {
+                #[cfg(target_os = "vita")]
+                if self.as_movie_clip().is_some_and(|movie| movie.is_root()) {
+                    let on_stage = self.avm2_stage(context).is_some();
+                    context.avm_warning(&format!(
+                        "vita_root added_events object2={} on_stage={}",
+                        self.object2().is_some(),
+                        on_stage
+                    ));
+                }
                 dispatch_added_event_only(self, context);
                 if self.avm2_stage(context).is_some() {
                     dispatch_added_to_stage_event_only(self, context);

@@ -3,6 +3,7 @@ use crate::avm1::ActivationIdentifier as Avm1ActivationIdentifier;
 use crate::avm1::Avm1;
 use crate::avm1::ExecutionReason as Avm1ExecutionReason;
 use crate::avm1::globals::AVM_DEPTH_BIAS;
+use crate::avm1::scope::{Scope, ScopeClass};
 use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::avm1::{NativeObject as Avm1NativeObject, Object as Avm1Object};
 use crate::avm2::Activation as Avm2Activation;
@@ -176,6 +177,7 @@ pub struct MovieClipData<'gc> {
     // side and an AVM2 side simultaneously.
     object1: Lock<Option<Avm1Object<'gc>>>,
     object2: Lock<Option<Avm2StageObject<'gc>>>,
+    avm1_action_scope: Lock<Option<Gc<'gc, Scope<'gc>>>>,
 
     drop_target: Lock<Option<DisplayObject<'gc>>>,
 
@@ -246,6 +248,7 @@ impl<'gc> MovieClipData<'gc> {
             audio_stream: Cell::new(None),
             object1: Lock::new(None),
             object2: Lock::new(None),
+            avm1_action_scope: Lock::new(None),
             clip_event_handlers: OnceCell::new(),
             clip_event_flags: Cell::new(ClipEventFlag::empty()),
             flags: Cell::new(MovieClipFlags::empty()),
@@ -272,6 +275,26 @@ impl<'gc> MovieClipData<'gc> {
 }
 
 impl<'gc> MovieClip<'gc> {
+    #[inline]
+    pub(crate) fn avm1_action_scope(self, context: &mut UpdateContext<'gc>) -> Gc<'gc, Scope<'gc>> {
+        if let Some(scope) = self.0.avm1_action_scope.get() {
+            return scope;
+        }
+
+        let clip_obj = self.object1_or_bare(context.gc());
+        let scope = Gc::new(
+            context.gc(),
+            Scope::new(
+                context.avm1.global_scope(self.swf_version()),
+                ScopeClass::Target,
+                clip_obj,
+            ),
+        );
+        let write = Gc::write(context.gc(), self.0);
+        unlock!(write, MovieClipData, avm1_action_scope).set(Some(scope));
+        scope
+    }
+
     pub fn downgrade(self) -> MovieClipWeak<'gc> {
         MovieClipWeak(Gc::downgrade(self.0))
     }
@@ -2004,6 +2027,7 @@ impl<'gc> MovieClip<'gc> {
             );
             let write = Gc::write(activation.gc(), self.0);
             unlock!(write, MovieClipData, object1).set(Some(object));
+            unlock!(write, MovieClipData, avm1_action_scope).set(None);
 
             if run_frame {
                 self.run_frame_avm1(activation.context);
@@ -2980,6 +3004,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         // Don't do anything if run in an AVM2 context.
         if self.movie().is_action_script_3() {
             return None;
@@ -3115,6 +3140,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         // Don't do anything if run in an AVM1 context.
         if !self.movie().is_action_script_3() {
             return Avm2MousePick::Miss;

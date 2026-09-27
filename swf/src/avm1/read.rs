@@ -2,6 +2,7 @@ use crate::avm1::opcode::OpCode;
 use crate::avm1::types::*;
 use crate::error::{Avm1ParseError, UnexpectedEof};
 use crate::extensions::ReadSwfExt;
+use smallvec::SmallVec;
 use std::num::NonZeroU8;
 
 type Result<T, E = UnexpectedEof> = std::result::Result<T, E>;
@@ -315,7 +316,7 @@ impl<'a> Reader<'a> {
     fn read_push(&mut self, length: usize) -> Result<Push<'a>> {
         // TODO: Verify correct version for complex types.
         let end_pos = (self.input.as_ptr() as usize + length) as *const u8;
-        let mut values = Vec::with_capacity(4);
+        let mut values = SmallVec::<[Value<'a>; 4]>::new();
         while self.input.as_ptr() < end_pos {
             let value = match self.read_u8()? {
                 0 => Value::Str(self.read_str()?),
@@ -477,7 +478,7 @@ pub mod tests {
             assert_eq!(
                 action,
                 Action::Push(Push {
-                    values: vec![Value::Str(
+                    values: smallvec::smallvec![Value::Str(
                         SwfStr::from_str_with_encoding("test", WINDOWS_1252).unwrap()
                     )]
                 })
@@ -503,7 +504,7 @@ pub mod tests {
         assert_eq!(
             action,
             Action::Push(Push {
-                values: vec![Value::Null, Value::Undefined]
+                values: smallvec::smallvec![Value::Null, Value::Undefined]
             })
         );
     }

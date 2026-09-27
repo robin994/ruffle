@@ -1229,6 +1229,7 @@ pub fn load_data_into_url_loader<'gc>(
 
             fn set_data<'a, 'gc: 'a>(
                 body: Vec<u8>,
+                transient_archive: bool,
                 activation: &mut Avm2Activation<'a, 'gc>,
                 target: Avm2Object<'gc>,
             ) {
@@ -1250,7 +1251,10 @@ pub fn load_data_into_url_loader<'gc>(
                     .expect("The dataFormat field is typed String");
 
                 let data_object = if &data_format == b"binary" {
-                    let storage = ByteArrayStorage::from_vec(activation.context, body);
+                    let mut storage = ByteArrayStorage::from_vec(activation.context, body);
+                    if transient_archive {
+                        storage.mark_transient_url_loader_archive();
+                    }
                     let bytearray = ByteArrayObject::from_storage(activation.context, storage);
 
                     Some(bytearray.into())
@@ -1283,8 +1287,13 @@ pub fn load_data_into_url_loader<'gc>(
             }
 
             match response {
-                Ok((body, _, status, redirected)) => {
+                Ok((body, url, status, redirected)) => {
                     let total_len = body.len();
+                    let clean_url = url.split(['?', '#']).next().unwrap_or(url.as_str());
+                    let url_bytes = clean_url.as_bytes();
+                    let transient_archive = cfg!(target_os = "vita")
+                        && url_bytes.len() >= 4
+                        && url_bytes[url_bytes.len() - 4..].eq_ignore_ascii_case(b".ssf");
 
                     // FIXME - the "open" event should be fired earlier, just before
                     // we start to fetch the data.
@@ -1297,7 +1306,7 @@ pub fn load_data_into_url_loader<'gc>(
                     // the Flash behavior w.r.t when an event is fired vs not fired.
                     let open_evt = Avm2EventObject::bare_default_event(activation.context, "open");
                     Avm2::dispatch_event(activation.context, open_evt, target);
-                    set_data(body, &mut activation, target);
+                    set_data(body, transient_archive, &mut activation, target);
 
                     // FIXME - we should fire "progress" events as we receive data, not
                     // just at the end
@@ -1329,7 +1338,7 @@ pub fn load_data_into_url_loader<'gc>(
                     // Testing with Flash shoes that the 'data' property is cleared
                     // when an error occurs
 
-                    set_data(Vec::new(), &mut activation, target);
+                    set_data(Vec::new(), false, &mut activation, target);
 
                     let (status_code, redirected) =
                         if let Error::HttpNotOk(_, status_code, redirected, _) = response.error {

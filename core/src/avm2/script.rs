@@ -13,6 +13,8 @@ use crate::avm2::scope::ScopeChain;
 use crate::avm2::traits::{Trait, TraitKind};
 use crate::avm2::vtable::VTable;
 use crate::avm2::{Avm2, Multiname, Namespace};
+#[cfg(target_os = "vita")]
+use crate::avm2::{QName, Value};
 use crate::context::UpdateContext;
 use crate::string::{AvmAtom, AvmString};
 use crate::tag_utils::SwfMovie;
@@ -546,6 +548,31 @@ pub struct ScriptData<'gc> {
 }
 
 impl<'gc> Script<'gc> {
+    #[cfg(target_os = "vita")]
+    fn apply_vita_compatibility(self, context: &mut UpdateContext<'gc>) {
+        let domain = self.0.domain;
+        let mut activation = Activation::from_domain(context, domain);
+        let class_name = AvmString::new_utf8(
+            activation.gc(),
+            "com.mcleodgaming.ssf2.util.ResourceManager",
+        );
+        let qname = QName::from_qualified_name(class_name, activation.context);
+
+        let Some((_, defining_script)) = domain.get_defining_script(&qname.into()) else {
+            return;
+        };
+        if !Gc::ptr_eq(defining_script.0, self.0) {
+            return;
+        }
+
+        let Ok(class_value) = domain.get_defined_value(&mut activation, qname) else {
+            return;
+        };
+        let property = AvmString::new_utf8(activation.gc(), "multimode");
+        let property = Multiname::new(activation.avm2().find_public_namespace(), property);
+        let _ = class_value.set_property(&property, Value::Bool(false), &mut activation);
+    }
+
     /// Construct a script from a `TranslationUnit` and its script index.
     ///
     /// The returned script will be allocated, and its traits will be loaded.
@@ -671,6 +698,8 @@ impl<'gc> Script<'gc> {
             self.0.initialized.set(true);
 
             Avm2::run_script_initializer(self, context)?;
+            #[cfg(target_os = "vita")]
+            self.apply_vita_compatibility(context);
         }
 
         Ok(self.0.globals)

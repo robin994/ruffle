@@ -24,7 +24,7 @@ mod parameters;
 mod property;
 mod property_map;
 mod runtime;
-mod scope;
+pub(crate) mod scope;
 mod value;
 mod xml;
 

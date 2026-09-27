@@ -54,6 +54,34 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use web_time::Instant;
 
+#[derive(Default, Clone, Copy)]
+pub struct VitaAvm1ActionProfile {
+    pub get_member: u64,
+    pub set_member: u64,
+    pub get_variable: u64,
+    pub set_variable: u64,
+    pub call_function: u64,
+    pub call_method: u64,
+    pub push: u64,
+    pub movieclip_refs: u64,
+}
+
+impl VitaAvm1ActionProfile {
+    #[inline]
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            get_member: self.get_member.saturating_sub(earlier.get_member),
+            set_member: self.set_member.saturating_sub(earlier.set_member),
+            get_variable: self.get_variable.saturating_sub(earlier.get_variable),
+            set_variable: self.set_variable.saturating_sub(earlier.set_variable),
+            call_function: self.call_function.saturating_sub(earlier.call_function),
+            call_method: self.call_method.saturating_sub(earlier.call_method),
+            push: self.push.saturating_sub(earlier.push),
+            movieclip_refs: self.movieclip_refs.saturating_sub(earlier.movieclip_refs),
+        }
+    }
+}
+
 /// `UpdateContext` holds shared data that is used by the various subsystems of Ruffle.
 /// `Player` creates this when it begins a tick and passes it through the call stack to
 /// children and the VM.
@@ -209,6 +237,17 @@ pub struct UpdateContext<'gc> {
 
     /// Amount of actions performed since the last timeout check
     pub actions_since_timeout_check: &'gc mut u32,
+
+    /// Total AVM1 actions executed by this player.
+    pub avm1_action_count: &'gc mut u64,
+
+    /// Lightweight AVM1 action category counters used by the Vita profiler.
+    pub vita_avm1_action_profile: &'gc mut VitaAvm1ActionProfile,
+
+    /// Vita-only mouse profiling counters. These stay aggregated per host tick.
+    pub vita_mouse_pick_tests: &'gc mut u64,
+    pub vita_mouse_event_dispatches: &'gc mut u64,
+    pub vita_mouse_actions: &'gc mut u64,
 
     /// The current frame processing phase.
     ///
@@ -557,6 +596,41 @@ impl<'gc> ActionQueue<'gc> {
         self.action_queue
             .iter_mut()
             .find_map(|(_, v)| v.pop_front())
+    }
+
+    #[cfg(target_os = "vita")]
+    pub fn vita_len(&self) -> usize {
+        self.action_queue.values().map(VecDeque::len).sum()
+    }
+
+    #[cfg(target_os = "vita")]
+    pub fn vita_bytecode_blocks(&self) -> Vec<SwfSlice> {
+        let mut seen = std::collections::HashSet::new();
+        let mut blocks = Vec::new();
+
+        let mut push_block = |block: &SwfSlice| {
+            let key = (Arc::as_ptr(&block.movie) as usize, block.start, block.end);
+            if seen.insert(key) {
+                blocks.push(block.clone());
+            }
+        };
+
+        for (_, queue) in self.action_queue.iter() {
+            for action in queue {
+                match &action.action_type {
+                    ActionType::Normal { bytecode, .. }
+                    | ActionType::Initialize { bytecode, .. } => push_block(bytecode),
+                    ActionType::Construct { events, .. } => {
+                        for event in events {
+                            push_block(event);
+                        }
+                    }
+                    ActionType::Method { .. } | ActionType::NotifyListeners { .. } => {}
+                }
+            }
+        }
+
+        blocks
     }
 }
 

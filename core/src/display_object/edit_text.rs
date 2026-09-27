@@ -3065,6 +3065,7 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         // Don't do anything if run in an AVM2 context.
         if self.as_displayobject().movie().is_action_script_3() {
             return None;
@@ -3088,6 +3089,7 @@ impl<'gc> TInteractiveObject<'gc> for EditText<'gc> {
         point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         // Don't do anything if run in an AVM1 context.
         if !self.as_displayobject().movie().is_action_script_3() {
             return Avm2MousePick::Miss;

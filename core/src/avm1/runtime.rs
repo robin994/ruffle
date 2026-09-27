@@ -15,8 +15,230 @@ use crate::tag_utils::SwfSlice;
 use crate::{avm_debug, avm1};
 use gc_arena::{Collect, Gc, Mutation};
 use std::borrow::Cow;
+#[cfg(target_os = "vita")]
+use std::collections::{HashMap, HashSet};
+#[cfg(target_os = "vita")]
+use std::ffi::c_void;
 use swf::avm1::read::Reader;
 use tracing::instrument;
+
+#[cfg(target_os = "vita")]
+unsafe extern "C" {
+    fn flashvita_vita_parallel_for(
+        count: u32,
+        min_grain: u32,
+        callback: unsafe extern "C" fn(*mut c_void, u32, u32),
+        user: *mut c_void,
+    ) -> i32;
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct VitaBlockKey {
+    movie: usize,
+    start: usize,
+    end: usize,
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Collect)]
+#[collect(require_static)]
+struct VitaPushKey {
+    movie: usize,
+    offset: usize,
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+pub(crate) enum VitaPushOperand<'gc> {
+    Static(Value<'gc>),
+    Register(u8),
+    Constant8(u8),
+    Constant16(u16),
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Collect)]
+#[collect(require_static)]
+struct VitaPushStringKey {
+    movie: usize,
+    action_offset: usize,
+    value_offset: u16,
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Default)]
+struct VitaFastActionCache {
+    prepared_blocks: HashSet<VitaBlockKey>,
+    push_lengths: HashMap<VitaPushKey, u16>,
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy)]
+struct VitaPredecodeTask {
+    data: *const u8,
+    len: usize,
+    movie_base: *const u8,
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy)]
+struct VitaPushMeta {
+    offset: u32,
+    len: u16,
+}
+
+#[cfg(target_os = "vita")]
+#[derive(Default)]
+struct VitaPredecodeOutput {
+    pushes: Vec<VitaPushMeta>,
+}
+
+#[cfg(target_os = "vita")]
+struct VitaPredecodeContext {
+    tasks: *const VitaPredecodeTask,
+    outputs: *mut VitaPredecodeOutput,
+}
+
+#[cfg(target_os = "vita")]
+#[inline]
+fn vita_read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let pair = bytes.get(offset..offset.checked_add(2)?)?;
+    Some(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+#[cfg(target_os = "vita")]
+fn vita_skip_c_string(bytes: &[u8], offset: &mut usize) -> Option<()> {
+    let rel = bytes.get(*offset..)?.iter().position(|&b| b == 0)?;
+    *offset = (*offset).checked_add(rel + 1)?;
+    Some(())
+}
+
+#[cfg(target_os = "vita")]
+fn vita_action_total_len(bytes: &[u8], offset: usize) -> Option<(u8, usize, Option<u16>)> {
+    let opcode = *bytes.get(offset)?;
+    if opcode < 0x80 {
+        return Some((opcode, 1, None));
+    }
+
+    let declared = vita_read_u16(bytes, offset + 1)? as usize;
+    let payload_start = offset.checked_add(3)?;
+    let declared_end = payload_start.checked_add(declared)?;
+    if declared_end > bytes.len() {
+        return None;
+    }
+
+    let mut extra = 0usize;
+    match opcode {
+        // DefineFunction: the function body is not included in ActionLength.
+        0x9B => {
+            let payload = &bytes[payload_start..declared_end];
+            let mut pos = 0usize;
+            vita_skip_c_string(payload, &mut pos)?;
+            let param_count = vita_read_u16(payload, pos)? as usize;
+            pos += 2;
+            for _ in 0..param_count {
+                vita_skip_c_string(payload, &mut pos)?;
+            }
+            extra = vita_read_u16(payload, pos)? as usize;
+        }
+        // DefineFunction2: same body-length rule with register metadata.
+        0x8E => {
+            let payload = &bytes[payload_start..declared_end];
+            let mut pos = 0usize;
+            vita_skip_c_string(payload, &mut pos)?;
+            let param_count = vita_read_u16(payload, pos)? as usize;
+            pos += 2;
+            pos = pos.checked_add(3)?; // register_count + flags
+            for _ in 0..param_count {
+                pos = pos.checked_add(1)?; // register index
+                vita_skip_c_string(payload, &mut pos)?;
+            }
+            extra = vita_read_u16(payload, pos)? as usize;
+        }
+        // Try bodies are stored after the declared action payload.
+        0x8F if declared >= 7 => {
+            let payload = &bytes[payload_start..declared_end];
+            extra = vita_read_u16(payload, 1)? as usize
+                + vita_read_u16(payload, 3)? as usize
+                + vita_read_u16(payload, 5)? as usize;
+        }
+        // With body is stored after the declared action payload.
+        0x94 if declared >= 2 => {
+            extra = vita_read_u16(bytes, payload_start)? as usize;
+        }
+        _ => {}
+    }
+
+    let total = 3usize.checked_add(declared)?.checked_add(extra)?;
+    if offset.checked_add(total)? > bytes.len() {
+        return None;
+    }
+    let push_len = (opcode == 0x96).then_some(declared as u16);
+    Some((opcode, total, push_len))
+}
+
+#[cfg(target_os = "vita")]
+fn vita_validate_push_payload(payload: &[u8]) -> bool {
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        let Some(&ty) = payload.get(pos) else {
+            return false;
+        };
+        pos += 1;
+        match ty {
+            0 => {
+                let Some(rel) = payload[pos..].iter().position(|&b| b == 0) else {
+                    return false;
+                };
+                pos += rel + 1;
+            }
+            1 | 7 => pos += 4,
+            2 | 3 => {}
+            4 | 5 | 8 => pos += 1,
+            6 => pos += 8,
+            9 => pos += 2,
+            _ => {}
+        }
+        if pos > payload.len() {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "vita")]
+unsafe extern "C" fn vita_predecode_worker(user: *mut c_void, begin: u32, end: u32) {
+    let context = unsafe { &*(user as *const VitaPredecodeContext) };
+    for index in begin as usize..end as usize {
+        let task = unsafe { *context.tasks.add(index) };
+        let output = unsafe { &mut *context.outputs.add(index) };
+        let bytes = unsafe { std::slice::from_raw_parts(task.data, task.len) };
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let Some((opcode, total, push_len)) = vita_action_total_len(bytes, pos) else {
+                break;
+            };
+            if let Some(len) = push_len {
+                let payload_start = pos + 3;
+                let payload_end = payload_start + len as usize;
+                if vita_validate_push_payload(&bytes[payload_start..payload_end]) {
+                    let action_offset = (task.data as usize + pos)
+                        .saturating_sub(task.movie_base as usize);
+                    output.pushes.push(VitaPushMeta {
+                        offset: action_offset as u32,
+                        len,
+                    });
+                }
+            }
+            pos += total;
+            if opcode == 0x00 {
+                break;
+            }
+        }
+    }
+}
 
 /// The global environment.
 ///
@@ -88,6 +310,16 @@ pub struct Avm1<'gc> {
     /// Used to prevent scrolling on web.
     has_mouse_listener: bool,
 
+    #[cfg(target_os = "vita")]
+    #[collect(require_static)]
+    vita_fast_actions: VitaFastActionCache,
+
+    #[cfg(target_os = "vita")]
+    vita_push_strings: HashMap<VitaPushStringKey, AvmString<'gc>>,
+
+    #[cfg(target_os = "vita")]
+    vita_push_plans: HashMap<VitaPushKey, Vec<VitaPushOperand<'gc>>>,
+
     /// The list of all movie clips in execution order.
     clip_exec_list: Option<MovieClip<'gc>>,
 
@@ -127,12 +359,187 @@ impl<'gc> Avm1<'gc> {
             halted: false,
             max_recursion_depth: 255,
             has_mouse_listener: false,
+            #[cfg(target_os = "vita")]
+            vita_fast_actions: VitaFastActionCache::default(),
+            #[cfg(target_os = "vita")]
+            vita_push_strings: HashMap::new(),
+            #[cfg(target_os = "vita")]
+            vita_push_plans: HashMap::new(),
             clip_exec_list: None,
 
             #[cfg(feature = "avm_debug")]
             debug_output: false,
             use_new_invalid_bounds_value: false,
         }
+    }
+
+    #[cfg(target_os = "vita")]
+    pub fn vita_predecode_blocks(&mut self, blocks: &[SwfSlice]) -> (usize, usize, bool) {
+        let mut pending = Vec::new();
+        let mut pending_keys = Vec::new();
+
+        for block in blocks {
+            let movie = std::sync::Arc::as_ptr(&block.movie) as usize;
+            let key = VitaBlockKey {
+                movie,
+                start: block.start,
+                end: block.end,
+            };
+            if self.vita_fast_actions.prepared_blocks.contains(&key) {
+                continue;
+            }
+
+            let data = block.data();
+            pending.push(VitaPredecodeTask {
+                data: data.as_ptr(),
+                len: data.len(),
+                movie_base: block.movie.data().as_ptr(),
+            });
+            pending_keys.push(key);
+        }
+
+        if pending.is_empty() {
+            return (0, 0, false);
+        }
+
+        let mut outputs = pending
+            .iter()
+            .map(|task| VitaPredecodeOutput {
+                // A zero-payload Push still occupies 3 bytes, so this capacity
+                // is a hard upper bound and guarantees no worker-side realloc.
+                pushes: Vec::with_capacity(task.len / 3 + 1),
+            })
+            .collect::<Vec<_>>();
+        let mut predecode_context = VitaPredecodeContext {
+            tasks: pending.as_ptr(),
+            outputs: outputs.as_mut_ptr(),
+        };
+
+        let parallel = if pending.len() >= 3 {
+            unsafe {
+                flashvita_vita_parallel_for(
+                    pending.len() as u32,
+                    1,
+                    vita_predecode_worker,
+                    (&mut predecode_context as *mut VitaPredecodeContext).cast(),
+                ) > 0
+            }
+        } else {
+            false
+        };
+
+        if !parallel {
+            unsafe {
+                vita_predecode_worker(
+                    (&mut predecode_context as *mut VitaPredecodeContext).cast(),
+                    0,
+                    pending.len() as u32,
+                );
+            }
+        }
+
+        let mut push_count = 0usize;
+        for (index, output) in outputs.into_iter().enumerate() {
+            let key = pending_keys[index];
+            for push in output.pushes {
+                self.vita_fast_actions.push_lengths.insert(
+                    VitaPushKey {
+                        movie: key.movie,
+                        offset: push.offset as usize,
+                    },
+                    push.len,
+                );
+                push_count += 1;
+            }
+            self.vita_fast_actions.prepared_blocks.insert(key);
+        }
+
+        (pending.len(), push_count, parallel)
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_fast_push_len(&self, movie: usize, offset: usize) -> Option<u16> {
+        self.vita_fast_actions
+            .push_lengths
+            .get(&VitaPushKey { movie, offset })
+            .copied()
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_record_fast_push_len(&mut self, movie: usize, offset: usize, len: u16) {
+        self.vita_fast_actions
+            .push_lengths
+            .insert(VitaPushKey { movie, offset }, len);
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_cached_push_string(
+        &self,
+        movie: usize,
+        action_offset: usize,
+        value_offset: u16,
+    ) -> Option<AvmString<'gc>> {
+        self.vita_push_strings
+            .get(&VitaPushStringKey {
+                movie,
+                action_offset,
+                value_offset,
+            })
+            .copied()
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_cache_push_string(
+        &mut self,
+        movie: usize,
+        action_offset: usize,
+        value_offset: u16,
+        string: AvmString<'gc>,
+    ) {
+        self.vita_push_strings.insert(
+            VitaPushStringKey {
+                movie,
+                action_offset,
+                value_offset,
+            },
+            string,
+        );
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_push_plan(
+        &self,
+        movie: usize,
+        action_offset: usize,
+    ) -> Option<smallvec::SmallVec<[VitaPushOperand<'gc>; 8]>> {
+        self.vita_push_plans
+            .get(&VitaPushKey {
+                movie,
+                offset: action_offset,
+            })
+            .map(|plan| smallvec::SmallVec::from_slice(plan))
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_cache_push_plan(
+        &mut self,
+        movie: usize,
+        action_offset: usize,
+        plan: Vec<VitaPushOperand<'gc>>,
+    ) {
+        self.vita_push_plans.insert(
+            VitaPushKey {
+                movie,
+                offset: action_offset,
+            },
+            plan,
+        );
     }
 
     pub fn load_player_globals(context: &mut UpdateContext<'gc>) {

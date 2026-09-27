@@ -761,6 +761,7 @@ impl<'gc> TInteractiveObject<'gc> for Avm2Button<'gc> {
         mut point: Point<Twips>,
         require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         // The button is hovered if the mouse is over any child nodes.
         if self.visible() && self.mouse_enabled() {
             let state_child = self.get_state_child(self.0.state.get().into());

@@ -1,5 +1,6 @@
 use crate::string::SwfStr;
 use bitflags::bitflags;
+use smallvec::SmallVec;
 use std::num::NonZeroU8;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -285,7 +286,7 @@ pub struct Jump {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Push<'a> {
-    pub values: Vec<Value<'a>>,
+    pub values: SmallVec<[Value<'a>; 4]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

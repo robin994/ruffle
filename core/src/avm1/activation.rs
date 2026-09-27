@@ -3,6 +3,8 @@ use crate::avm1::error::Error;
 use crate::avm1::function::{Avm1Function, ExecutionReason, FunctionObject};
 use crate::avm1::property::Attribute;
 use crate::avm1::runtime::skip_actions;
+#[cfg(target_os = "vita")]
+use crate::avm1::runtime::VitaPushOperand;
 use crate::avm1::scope::{Scope, ScopeClass};
 use crate::avm1::{ArrayBuilder, Object, Value, fscommand, globals, scope};
 use crate::backend::navigator::{NavigationMethod, Request};
@@ -520,6 +522,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         reader: &mut Reader<'b>,
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         *self.context.actions_since_timeout_check += 1;
+        *self.context.avm1_action_count += 1;
         if *self.context.actions_since_timeout_check >= 2000 {
             *self.context.actions_since_timeout_check = 0;
             if self.context.update_start.elapsed() >= self.context.max_execution_duration {
@@ -532,6 +535,19 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             Ok(FrameControl::Return(ReturnType::Implicit))
         } else {
             let action = reader.read_action()?;
+
+            let vita_profile = &mut *self.context.vita_avm1_action_profile;
+            match &action {
+                Action::GetMember => vita_profile.get_member += 1,
+                Action::SetMember => vita_profile.set_member += 1,
+                Action::GetVariable => vita_profile.get_variable += 1,
+                Action::SetVariable => vita_profile.set_variable += 1,
+                Action::CallFunction => vita_profile.call_function += 1,
+                Action::CallMethod => vita_profile.call_method += 1,
+                Action::Push(_) => vita_profile.push += 1,
+                _ => {}
+            }
+
             avm_debug!(
                 self.context.avm1,
                 "({}) Action: {action:?}",
@@ -644,6 +660,298 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
     }
 
+    #[cfg(target_os = "vita")]
+    #[inline(always)]
+    fn try_vita_fast_action<'b>(
+        &mut self,
+        data: &'b SwfSlice,
+        reader: &mut Reader<'b>,
+    ) -> Option<Result<FrameControl<'gc>, Error<'gc>>> {
+        let input = reader.get_ref();
+        let opcode = *input.first()?;
+
+        if opcode == 0x96 {
+            return self.try_vita_fast_push(data, reader);
+        }
+
+        let result = match opcode {
+            0x0A => self.action_add(),
+            0x0B => self.action_subtract(),
+            0x0C => self.action_multiply(),
+            0x0D => self.action_divide(),
+            0x0E => self.action_equals(),
+            0x0F => self.action_less(),
+            0x10 => self.action_and(),
+            0x11 => self.action_or(),
+            0x12 => self.action_not(),
+            0x13 => self.action_string_equals(),
+            0x14 => self.action_string_length(),
+            0x15 => self.action_string_extract(),
+            0x17 => self.action_pop(),
+            0x18 => self.action_to_integer(),
+            0x1C => {
+                self.context.vita_avm1_action_profile.get_variable += 1;
+                self.action_get_variable()
+            }
+            0x1D => {
+                self.context.vita_avm1_action_profile.set_variable += 1;
+                self.action_set_variable()
+            }
+            0x21 => self.action_string_add(),
+            0x22 => self.action_get_property(),
+            0x23 => self.action_set_property(),
+            0x26 => self.action_trace(),
+            0x29 => self.action_string_less(),
+            0x30 => self.action_random_number(),
+            0x34 => self.action_get_time(),
+            0x3A => self.action_delete(),
+            0x3B => self.action_delete_2(),
+            0x3C => self.action_define_local(),
+            0x3D => {
+                self.context.vita_avm1_action_profile.call_function += 1;
+                self.action_call_function()
+            }
+            0x3E => self.action_return(),
+            0x3F => self.action_modulo(),
+            0x40 => self.action_new_object(),
+            0x41 => self.action_define_local_2(),
+            0x42 => self.action_init_array(),
+            0x43 => self.action_init_object(),
+            0x44 => self.action_type_of(),
+            0x45 => self.action_target_path(),
+            0x47 => self.action_add_2(),
+            0x48 => self.action_less_2(),
+            0x49 => self.action_equals_2(),
+            0x4A => self.action_to_number(),
+            0x4B => self.action_to_string(),
+            0x4C => self.action_push_duplicate(),
+            0x4D => self.action_stack_swap(),
+            0x4E => {
+                self.context.vita_avm1_action_profile.get_member += 1;
+                self.action_get_member()
+            }
+            0x4F => {
+                self.context.vita_avm1_action_profile.set_member += 1;
+                self.action_set_member()
+            }
+            0x50 => self.action_increment(),
+            0x51 => self.action_decrement(),
+            0x52 => {
+                self.context.vita_avm1_action_profile.call_method += 1;
+                self.action_call_method()
+            }
+            0x53 => self.action_new_method(),
+            0x54 => self.action_instance_of(),
+            0x55 => self.action_enumerate_2(),
+            0x60 => self.action_bit_and(),
+            0x61 => self.action_bit_or(),
+            0x62 => self.action_bit_xor(),
+            0x63 => self.action_bit_lshift(),
+            0x64 => self.action_bit_rshift(),
+            0x65 => self.action_bit_urshift(),
+            0x66 => self.action_strict_equals(),
+            0x67 => self.action_greater(),
+            0x68 => self.action_string_greater(),
+            _ => return None,
+        };
+
+        *reader.get_mut() = &input[1..];
+        Some(result)
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    fn try_vita_fast_push<'b>(
+        &mut self,
+        data: &'b SwfSlice,
+        reader: &mut Reader<'b>,
+    ) -> Option<Result<FrameControl<'gc>, Error<'gc>>> {
+        let input = reader.get_ref();
+        if input.len() < 3 || input[0] != 0x96 {
+            return None;
+        }
+
+        let payload_len = u16::from_le_bytes([input[1], input[2]]) as usize;
+        let end = 3usize.checked_add(payload_len)?;
+        if end > input.len() {
+            return None;
+        }
+        let payload = &input[3..end];
+
+        let movie_key = std::sync::Arc::as_ptr(&data.movie) as usize;
+        let action_offset = (input.as_ptr() as usize)
+            .saturating_sub(data.movie.data().as_ptr() as usize);
+
+        if let Some(plan) = self.context.avm1.vita_push_plan(movie_key, action_offset) {
+            self.context.vita_avm1_action_profile.push += 1;
+            for operand in plan {
+                let value = match operand {
+                    VitaPushOperand::Static(value) => value,
+                    VitaPushOperand::Register(register) => self.current_register(register),
+                    VitaPushOperand::Constant8(index) => self
+                        .constant_pool()
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(Value::Undefined),
+                    VitaPushOperand::Constant16(index) => self
+                        .constant_pool()
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(Value::Undefined),
+                };
+                self.stack_push(value);
+            }
+            *reader.get_mut() = &input[end..];
+            return Some(Ok(FrameControl::Continue));
+        }
+
+        let predecoded = self
+            .context
+            .avm1
+            .vita_fast_push_len(movie_key, action_offset)
+            .is_some_and(|cached| cached as usize == payload_len);
+
+        if !predecoded {
+            let mut pos = 0usize;
+            while pos < payload.len() {
+                let ty = payload[pos];
+                pos += 1;
+                let needed = match ty {
+                    0 => {
+                        let rel = payload[pos..].iter().position(|&b| b == 0)?;
+                        pos = pos.checked_add(rel + 1)?;
+                        continue;
+                    }
+                    1 | 7 => 4,
+                    2 | 3 => 0,
+                    4 | 5 | 8 => 1,
+                    6 => 8,
+                    9 => 2,
+                    _ => 0,
+                };
+                pos = pos.checked_add(needed)?;
+                if pos > payload.len() {
+                    return None;
+                }
+            }
+
+            self.context.avm1.vita_record_fast_push_len(
+                movie_key,
+                action_offset,
+                payload_len as u16,
+            );
+        }
+
+        self.context.vita_avm1_action_profile.push += 1;
+        let mut plan = Vec::new();
+        let mut pos = 0usize;
+        while pos < payload.len() {
+            let ty = payload[pos];
+            pos += 1;
+            let value = match ty {
+                0 => {
+                    let value_offset = pos as u16;
+                    let rel = payload[pos..].iter().position(|&b| b == 0).unwrap_or(0);
+                    let cached = self.context.avm1.vita_cached_push_string(
+                        movie_key,
+                        action_offset,
+                        value_offset,
+                    );
+                    let value = if let Some(string) = cached {
+                        string
+                    } else {
+                        let swf_string = swf::SwfStr::from_bytes(&payload[pos..pos + rel]);
+                        let string = AvmString::from(
+                            self.context
+                                .strings
+                                .intern(AvmString::new(self.gc(), swf_string.decode(self.encoding()))),
+                        );
+                        self.context.avm1.vita_cache_push_string(
+                            movie_key,
+                            action_offset,
+                            value_offset,
+                            string,
+                        );
+                        string
+                    };
+                    pos += rel + 1;
+                    let value = Value::from(value);
+                    plan.push(VitaPushOperand::Static(value));
+                    value
+                }
+                1 => {
+                    let bits = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
+                    pos += 4;
+                    let value = Value::from(f32::from_bits(bits));
+                    plan.push(VitaPushOperand::Static(value));
+                    value
+                }
+                2 => {
+                    plan.push(VitaPushOperand::Static(Value::Null));
+                    Value::Null
+                }
+                3 => {
+                    plan.push(VitaPushOperand::Static(Value::Undefined));
+                    Value::Undefined
+                }
+                4 => {
+                    let register = payload[pos];
+                    pos += 1;
+                    plan.push(VitaPushOperand::Register(register));
+                    self.current_register(register)
+                }
+                5 => {
+                    let value = payload[pos] != 0;
+                    pos += 1;
+                    let value = Value::from(value);
+                    plan.push(VitaPushOperand::Static(value));
+                    value
+                }
+                6 => {
+                    let bits = u64::from_le_bytes(payload[pos..pos + 8].try_into().ok()?).rotate_left(32);
+                    pos += 8;
+                    let value = Value::from(f64::from_bits(bits));
+                    plan.push(VitaPushOperand::Static(value));
+                    value
+                }
+                7 => {
+                    let value = i32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
+                    pos += 4;
+                    let value = Value::from(value);
+                    plan.push(VitaPushOperand::Static(value));
+                    value
+                }
+                8 => {
+                    let index = payload[pos];
+                    pos += 1;
+                    plan.push(VitaPushOperand::Constant8(index));
+                    self.constant_pool()
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(Value::Undefined)
+                }
+                9 => {
+                    let index = u16::from_le_bytes(payload[pos..pos + 2].try_into().ok()?);
+                    pos += 2;
+                    plan.push(VitaPushOperand::Constant16(index));
+                    self.constant_pool()
+                        .get(index as usize)
+                        .copied()
+                        .unwrap_or(Value::Undefined)
+                }
+                _ => continue,
+            };
+            self.stack_push(value);
+        }
+
+        self.context
+            .avm1
+            .vita_cache_push_plan(movie_key, action_offset, plan);
+
+        *reader.get_mut() = &input[end..];
+        Some(Ok(FrameControl::Continue))
+    }
+
     fn stack_push(&mut self, mut value: Value<'gc>) {
         if let Value::Object(obj) = value {
             // Note that there currently exists a subtle issue with this logic:
@@ -655,6 +963,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             // can refer to a MovieClip
             // There is a ignored test for this issue of "reference laundering" at "avm1/string_paths_reference_launder"
             if let Some(mcr) = MovieClipReference::try_from_stage_object(self, obj) {
+                self.context.vita_avm1_action_profile.movieclip_refs += 1;
                 value = Value::MovieClip(mcr);
             }
         }

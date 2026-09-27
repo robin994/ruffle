@@ -2,11 +2,123 @@ use crate::sandbox::SandboxType;
 
 use gc_arena::Collect;
 use std::fmt::{Debug, Formatter};
+use std::ops::Deref;
 use std::sync::Arc;
 use swf::{Fixed8, HeaderExt, Rectangle, Twips};
 use url::Url;
 
 pub type SwfStream<'a> = swf::read::Reader<'a>;
+
+#[derive(Clone)]
+enum SwfStorage {
+    Owned(Vec<u8>),
+    #[cfg(target_os = "vita")]
+    Vita(Arc<VitaSwfMemBlock>),
+}
+
+impl SwfStorage {
+    fn from_vec(data: Vec<u8>) -> Self {
+        #[cfg(target_os = "vita")]
+        {
+            const VITA_MEMBLOCK_THRESHOLD: usize = 8 * 1024 * 1024;
+            if data.len() >= VITA_MEMBLOCK_THRESHOLD {
+                let mut uid = -1;
+                let base = unsafe { flashvita_vita_memblock_alloc(data.len(), &mut uid) };
+                if !base.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            base.cast::<u8>(),
+                            data.len(),
+                        );
+                    }
+                    return Self::Vita(Arc::new(VitaSwfMemBlock {
+                        uid,
+                        base: base.cast::<u8>(),
+                        len: data.len(),
+                    }));
+                }
+            }
+        }
+
+        Self::Owned(data)
+    }
+
+    fn len(&self) -> usize {
+        self.deref().len()
+    }
+
+    #[cfg(target_os = "vita")]
+    unsafe fn from_reserved_vita_memblock(
+        data: Vec<u8>,
+        uid: i32,
+        base: *mut u8,
+        capacity: usize,
+    ) -> Self {
+        if uid < 0 || base.is_null() || data.len() > capacity {
+            if uid >= 0 || uid == -2 {
+                unsafe {
+                    flashvita_vita_memblock_free(uid, base.cast());
+                }
+            }
+            return Self::from_vec(data);
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), base, data.len());
+        }
+        Self::Vita(Arc::new(VitaSwfMemBlock {
+            uid,
+            base,
+            len: data.len(),
+        }))
+    }
+}
+
+impl Deref for SwfStorage {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(data) => data.as_slice(),
+            #[cfg(target_os = "vita")]
+            Self::Vita(data) => unsafe { std::slice::from_raw_parts(data.base, data.len) },
+        }
+    }
+}
+
+impl AsRef<[u8]> for SwfStorage {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+#[cfg(target_os = "vita")]
+struct VitaSwfMemBlock {
+    uid: i32,
+    base: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "vita")]
+unsafe impl Send for VitaSwfMemBlock {}
+#[cfg(target_os = "vita")]
+unsafe impl Sync for VitaSwfMemBlock {}
+
+#[cfg(target_os = "vita")]
+impl Drop for VitaSwfMemBlock {
+    fn drop(&mut self) {
+        unsafe {
+            flashvita_vita_memblock_free(self.uid, self.base.cast());
+        }
+    }
+}
+
+#[cfg(target_os = "vita")]
+unsafe extern "C" {
+    fn flashvita_vita_memblock_alloc(bytes: usize, uid_out: *mut i32) -> *mut std::ffi::c_void;
+    fn flashvita_vita_memblock_free(uid: i32, base: *mut std::ffi::c_void) -> i32;
+}
 
 /// An open, fully parsed SWF movie ready to play back, either in a Player or a
 /// MovieClip.
@@ -17,7 +129,7 @@ pub struct SwfMovie {
     header: HeaderExt,
 
     /// Uncompressed SWF data.
-    data: Vec<u8>,
+    data: SwfStorage,
 
     /// The URL the SWF was downloaded from.
     url: String,
@@ -67,7 +179,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         Self {
             header,
-            data: vec![],
+            data: SwfStorage::Owned(vec![]),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -97,7 +209,7 @@ impl SwfMovie {
         Self {
             header,
             compressed_len,
-            data: Vec::new(),
+            data: SwfStorage::Owned(Vec::new()),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -124,7 +236,7 @@ impl SwfMovie {
         Self {
             header,
             compressed_len: compressed_data.len(),
-            data: compressed_data,
+            data: SwfStorage::from_vec(compressed_data),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -148,7 +260,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(movie_url.as_str(), &header);
         Self {
             header,
-            data: vec![],
+            data: SwfStorage::Owned(vec![]),
             url: movie_url,
             loader_url: None,
             parameters: Vec::new(),
@@ -172,6 +284,26 @@ impl SwfMovie {
     ) -> Result<Self, swf::error::Error> {
         let compressed_len = swf_data.len();
         let swf_buf = swf::read::decompress_swf(swf_data)?;
+        Ok(Self::from_swf_buf(
+            swf_buf,
+            compressed_len,
+            url,
+            loader_url,
+            load_bytes_info,
+        ))
+    }
+
+    /// Construct a movie from an already-decompressed SWF buffer.
+    ///
+    /// Vita uses this to avoid decompressing large CWS movies twice during
+    /// startup just to gather metadata before constructing the player.
+    pub fn from_swf_buf(
+        swf_buf: swf::SwfBuf,
+        compressed_len: usize,
+        url: String,
+        loader_url: Option<String>,
+        load_bytes_info: Option<LoadBytesInfo>,
+    ) -> Self {
         let encoding = swf::SwfStr::encoding_for_version(swf_buf.header.version());
 
         // The loader SWF has full control over the tags of a SWF loaded using
@@ -185,7 +317,7 @@ impl SwfMovie {
 
         let mut movie = Self {
             header: swf_buf.header,
-            data: swf_buf.data,
+            data: SwfStorage::from_vec(swf_buf.data),
             url,
             loader_url,
             parameters: Vec::new(),
@@ -197,7 +329,47 @@ impl SwfMovie {
             sandbox_type,
         };
         movie.append_parameters_from_url();
-        Ok(movie)
+        movie
+    }
+
+    #[cfg(target_os = "vita")]
+    pub unsafe fn from_swf_buf_with_reserved_vita_memblock(
+        swf_buf: swf::SwfBuf,
+        compressed_len: usize,
+        url: String,
+        loader_url: Option<String>,
+        load_bytes_info: Option<LoadBytesInfo>,
+        uid: i32,
+        base: *mut u8,
+        capacity: usize,
+    ) -> Self {
+        let encoding = swf::SwfStr::encoding_for_version(swf_buf.header.version());
+        let sandbox_type = load_bytes_info
+            .map(|i| i.loader_sandbox_type)
+            .unwrap_or_else(|| SandboxType::infer(url.as_str(), &swf_buf.header));
+
+        let mut movie = Self {
+            header: swf_buf.header,
+            data: unsafe {
+                SwfStorage::from_reserved_vita_memblock(
+                    swf_buf.data,
+                    uid,
+                    base,
+                    capacity,
+                )
+            },
+            url,
+            loader_url,
+            parameters: Vec::new(),
+            encoding,
+            compressed_len,
+            is_movie: true,
+            force_avm1: false,
+            is_from_bytes: load_bytes_info.is_some(),
+            sandbox_type,
+        };
+        movie.append_parameters_from_url();
+        movie
     }
 
     /// Construct a movie based on a loaded image (JPEG, GIF or PNG).
@@ -215,7 +387,7 @@ impl SwfMovie {
         let sandbox_type = SandboxType::infer(url.as_str(), &header);
         let mut movie = Self {
             header,
-            data: vec![],
+            data: SwfStorage::Owned(vec![]),
             url,
             loader_url: None,
             parameters: Vec::new(),
@@ -256,7 +428,7 @@ impl SwfMovie {
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data
+        self.data.as_ref()
     }
 
     /// Returns the suggested string encoding for the given SWF version.

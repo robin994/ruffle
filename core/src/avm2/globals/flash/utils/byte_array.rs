@@ -84,14 +84,18 @@ pub fn write_bytes<'gc>(
         let ba_read = bytearray
             .as_bytearray()
             .expect("Parameter must be a bytearray");
+        let amount = if length != 0 {
+            length
+        } else {
+            ba_read.len().saturating_sub(offset)
+        };
+        let release_transient_archive =
+            cfg!(target_os = "vita")
+                && ba_read.can_release_transient_archive_after_copy(offset, amount);
         let to_write = ba_read
             .read_at(
                 // If length is 0, lets read the remaining bytes of ByteArray from the supplied offset
-                if length != 0 {
-                    length
-                } else {
-                    ba_read.len().saturating_sub(offset)
-                },
+                amount,
                 offset,
             )
             .map_err(|e| e.to_avm(activation))?;
@@ -100,6 +104,13 @@ pub fn write_bytes<'gc>(
             bytearray
                 .write_bytes(to_write)
                 .map_err(|e| e.to_avm(activation))?;
+        }
+        drop(ba_read);
+
+        if release_transient_archive
+            && let Some(mut source) = bytearray.as_bytearray_mut()
+        {
+            source.release_transient_archive();
         }
     } else if let Some(mut bytearray) = this.as_bytearray_mut() {
         // The ByteArray we are reading from is the same as the ByteArray we are writing to,
@@ -745,11 +756,8 @@ pub fn compress<'gc>(
             Some(algorithm) => algorithm,
             None => return Err(make_error_2058(activation)),
         };
-        let buffer = bytearray.compress(algorithm);
-        bytearray.clear();
-        bytearray
-            .write_bytes(&buffer)
-            .map_err(|e| e.to_avm(activation))?;
+        let mut buffer = bytearray.compress(algorithm);
+        bytearray.swap_storage_with(&mut buffer);
         bytearray.set_position(bytearray.len());
     }
 
@@ -769,15 +777,14 @@ pub fn uncompress<'gc>(
             Some(algorithm) => algorithm,
             None => return Err(make_error_2058(activation)),
         };
-        let buffer = match bytearray.decompress(algorithm) {
+        let mut buffer = match bytearray.decompress(algorithm) {
             Some(buffer) => buffer,
             None => return Err(make_error_2058(activation)),
         };
-        bytearray.clear();
-        bytearray
-            .write_bytes(&buffer)
-            .map_err(|e| e.to_avm(activation))?;
-        bytearray.set_position(0);
+        // Move the decompressed allocation directly into the ByteArray.
+        // The old compressed storage moves into buffer and is freed when it
+        // goes out of scope, avoiding a second full-size allocation/copy.
+        bytearray.swap_storage_with(&mut buffer);
     }
 
     Ok(Value::Undefined)

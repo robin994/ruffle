@@ -24,7 +24,9 @@ use crate::backend::{
 use crate::compatibility_rules::CompatibilityRules;
 use crate::compatibility_rules::UrlRewriteStage;
 use crate::config::Letterbox;
-use crate::context::{ActionQueue, ActionType, RenderContext, UpdateContext};
+use crate::context::{
+    ActionQueue, ActionType, RenderContext, UpdateContext, VitaAvm1ActionProfile,
+};
 use crate::context_menu::{
     BuiltInItemFlags, ContextMenuCallback, ContextMenuItem, ContextMenuState,
 };
@@ -352,6 +354,9 @@ pub struct Player {
     frame_rate: f64,
     forced_frame_rate: bool,
     actions_since_timeout_check: u32,
+    avm1_action_count: u64,
+    vita_avm1_action_profile: VitaAvm1ActionProfile,
+    vita_frame_profile: VitaFrameProfile,
 
     frame_phase: FramePhase,
 
@@ -420,6 +425,74 @@ pub struct Player {
     /// Debug UI windows
     #[cfg(feature = "egui")]
     debug_ui: Rc<RefCell<crate::debug_ui::DebugUi>>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct VitaFrameProfile {
+    pub preload_us: u64,
+    pub avm2_us: u64,
+    pub avm1_us: u64,
+    pub audio_us: u64,
+    pub local_connections_us: u64,
+    pub callbacks_us: u64,
+    pub avm1_actions: u64,
+    pub avm1_get_member: u64,
+    pub avm1_set_member: u64,
+    pub avm1_get_variable: u64,
+    pub avm1_set_variable: u64,
+    pub avm1_call_function: u64,
+    pub avm1_call_method: u64,
+    pub avm1_push: u64,
+    pub queued_actions_us: u64,
+    pub queued_actions: u64,
+    pub queued_items: u64,
+    pub queued_normal: u64,
+    pub queued_initialize: u64,
+    pub queued_construct: u64,
+    pub queued_method: u64,
+    pub queued_notify: u64,
+    pub queued_get_member: u64,
+    pub queued_set_member: u64,
+    pub queued_get_variable: u64,
+    pub queued_set_variable: u64,
+    pub queued_call_function: u64,
+    pub queued_call_method: u64,
+    pub queued_push: u64,
+    pub queued_movieclip_refs: u64,
+    pub queued_predecode_blocks: u64,
+    pub queued_predecode_pushes: u64,
+    pub queued_predecode_parallel: u64,
+    pub mouse_us: u64,
+    pub mouse_drag_us: u64,
+    pub mouse_state_us: u64,
+    pub mouse_pick_tests: u64,
+    pub mouse_event_dispatches: u64,
+    pub mouse_actions: u64,
+    pub gc_us: u64,
+    pub update_calls: u64,
+    pub run_frame_total_us: u64,
+    pub timers_us: u64,
+    pub timer_actions: u64,
+    pub sockets_us: u64,
+    pub net_us: u64,
+    pub stream_us: u64,
+    pub stream_body_us: u64,
+    pub stream_active: u64,
+    pub stream_queued: u64,
+    pub audio_tick_us: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct VitaQueuedActionProfile {
+    items: u64,
+    normal: u64,
+    initialize: u64,
+    construct: u64,
+    method: u64,
+    notify: u64,
+    predecode_blocks: u64,
+    predecode_pushes: u64,
+    predecode_parallel: u64,
 }
 
 impl Player {
@@ -550,6 +623,8 @@ impl Player {
             return;
         }
 
+        self.vita_frame_profile = VitaFrameProfile::default();
+
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
 
@@ -559,6 +634,10 @@ impl Player {
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
+            self.vita_frame_profile.run_frame_total_us = self
+                .vita_frame_profile
+                .run_frame_total_us
+                .saturating_add(timer.elapsed().as_micros() as u64);
             let elapsed = timer.elapsed().as_millis() as f64;
 
             self.add_frame_timing(elapsed);
@@ -604,13 +683,50 @@ impl Player {
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
+        let phase_begin = Instant::now();
         self.update_sockets();
+        self.vita_frame_profile.sockets_us = phase_begin.elapsed().as_micros() as u64;
+
+        let phase_begin = Instant::now();
         self.update_net_connections();
+        self.vita_frame_profile.net_us = phase_begin.elapsed().as_micros() as u64;
+
+        let timer_actions_before = self.avm1_action_count;
+        let phase_begin = Instant::now();
         self.update_timers(dt);
+        self.vita_frame_profile.timers_us = phase_begin.elapsed().as_micros() as u64;
+        self.vita_frame_profile.timer_actions = self
+            .avm1_action_count
+            .saturating_sub(timer_actions_before);
+
+        let phase_begin = Instant::now();
+        let mut stream_body_us = 0u64;
+        let mut stream_active = 0u64;
+        let mut stream_queued = 0u64;
         self.update(|context| {
+            #[cfg(target_os = "vita")]
+            {
+                stream_active = context.stream_manager.vita_active_count() as u64;
+                let queued_before = context.action_queue.vita_len();
+                let body_begin = Instant::now();
+                StreamManager::tick(context, dt);
+                stream_body_us = body_begin.elapsed().as_micros() as u64;
+                stream_queued = context
+                    .action_queue
+                    .vita_len()
+                    .saturating_sub(queued_before) as u64;
+            }
+            #[cfg(not(target_os = "vita"))]
             StreamManager::tick(context, dt);
         });
+        self.vita_frame_profile.stream_us = phase_begin.elapsed().as_micros() as u64;
+        self.vita_frame_profile.stream_body_us = stream_body_us;
+        self.vita_frame_profile.stream_active = stream_active;
+        self.vita_frame_profile.stream_queued = stream_queued;
+
+        let phase_begin = Instant::now();
         self.audio.tick();
+        self.vita_frame_profile.audio_tick_us = phase_begin.elapsed().as_micros() as u64;
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -1891,6 +2007,9 @@ impl Player {
             let needs_render = if events.is_empty() {
                 false
             } else {
+                *context.vita_mouse_event_dispatches = context
+                    .vita_mouse_event_dispatches
+                    .saturating_add(events.len() as u64);
                 let mut refresh = false;
                 for (object, event) in events {
                     let display_object = object.as_displayobject();
@@ -1927,7 +2046,11 @@ impl Player {
                 new_cursor = forced;
             }
 
+            let mouse_actions_before = *context.avm1_action_count;
             Self::run_actions(context);
+            *context.vita_mouse_actions = context
+                .vita_mouse_actions
+                .saturating_add(context.avm1_action_count.saturating_sub(mouse_actions_before));
             needs_render
         });
 
@@ -2045,6 +2168,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        let preload_begin = Instant::now();
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
@@ -2059,26 +2183,77 @@ impl Player {
             LoadBehavior::Blocking => (ExecutionLimit::none(), false),
         };
         let preload_finished = self.preload(&mut execution_limit);
+        let preload_us = preload_begin.elapsed().as_micros() as u64;
 
         if !preload_finished && !may_execute_while_streaming {
+            self.vita_frame_profile = VitaFrameProfile {
+                preload_us,
+                ..self.vita_frame_profile
+            };
             return;
         }
 
+        let mut avm2_us = 0;
+        let mut avm1_us = 0;
+        let mut audio_us = 0;
+        let mut local_connections_us = 0;
+        let mut callbacks_us = 0;
+        let mut avm1_actions = 0;
+        let mut avm1_profile = VitaAvm1ActionProfile::default();
         self.update(|context| {
             // TODO: Is this order correct?
+            let begin = Instant::now();
             run_all_phases_avm2(context);
+            avm2_us = begin.elapsed().as_micros() as u64;
+
+            let actions_before = *context.avm1_action_count;
+            let action_profile_before = *context.vita_avm1_action_profile;
+            let begin = Instant::now();
             Avm1::run_frame(context);
+            avm1_us = begin.elapsed().as_micros() as u64;
+            avm1_actions = context.avm1_action_count.saturating_sub(actions_before);
+            avm1_profile = (*context.vita_avm1_action_profile).saturating_sub(action_profile_before);
+
+            let begin = Instant::now();
             AudioManager::update_sounds(context);
+            audio_us = begin.elapsed().as_micros() as u64;
+
+            let begin = Instant::now();
             LocalConnections::update_connections(context);
+            local_connections_us = begin.elapsed().as_micros() as u64;
 
             // Only run the current list of callbacks - any callbacks added during callback execution
             // will be run at the end of the *next* frame.
+            let begin = Instant::now();
             for cb in std::mem::take(context.post_frame_callbacks) {
                 (cb.callback)(context, cb.data);
             }
+            callbacks_us = begin.elapsed().as_micros() as u64;
         });
 
+        self.vita_frame_profile = VitaFrameProfile {
+            preload_us,
+            avm2_us,
+            avm1_us,
+            audio_us,
+            local_connections_us,
+            callbacks_us,
+            avm1_actions,
+            avm1_get_member: avm1_profile.get_member,
+            avm1_set_member: avm1_profile.set_member,
+            avm1_get_variable: avm1_profile.get_variable,
+            avm1_set_variable: avm1_profile.set_variable,
+            avm1_call_function: avm1_profile.call_function,
+            avm1_call_method: avm1_profile.call_method,
+            avm1_push: avm1_profile.push,
+            ..self.vita_frame_profile
+        };
+
         self.needs_render = true;
+    }
+
+    pub fn vita_frame_profile(&self) -> VitaFrameProfile {
+        self.vita_frame_profile
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2197,9 +2372,18 @@ impl Player {
         &mut *self.ui
     }
 
-    pub fn run_actions(context: &mut UpdateContext<'_>) {
+    pub fn run_actions(context: &mut UpdateContext<'_>) -> VitaQueuedActionProfile {
+        let mut profile = VitaQueuedActionProfile::default();
         // Note that actions can queue further actions, so a while loop is necessary here.
         while let Some(action) = context.action_queue.pop_action() {
+            profile.items += 1;
+            match &action.action_type {
+                ActionType::Normal { .. } => profile.normal += 1,
+                ActionType::Initialize { .. } => profile.initialize += 1,
+                ActionType::Construct { .. } => profile.construct += 1,
+                ActionType::Method { .. } => profile.method += 1,
+                ActionType::NotifyListeners { .. } => profile.notify += 1,
+            }
             // We don't run frame actions if the clip was removed (or scheduled to be removed) after it queued the action.
             if !action.is_unload
                 && (!action.clip.movie().is_action_script_3()
@@ -2276,6 +2460,7 @@ impl Player {
                 }
             }
         }
+        profile
     }
 
     /// Runs the closure `f` with an `UpdateContext`.
@@ -2358,6 +2543,11 @@ impl Player {
                 frame_rate: &mut this.frame_rate,
                 forced_frame_rate: this.forced_frame_rate,
                 actions_since_timeout_check: &mut this.actions_since_timeout_check,
+                avm1_action_count: &mut this.avm1_action_count,
+                vita_avm1_action_profile: &mut this.vita_avm1_action_profile,
+                vita_mouse_pick_tests: &mut this.vita_frame_profile.mouse_pick_tests,
+                vita_mouse_event_dispatches: &mut this.vita_frame_profile.mouse_event_dispatches,
+                vita_mouse_actions: &mut this.vita_frame_profile.mouse_actions,
                 frame_phase: &mut this.frame_phase,
                 stub_tracker: &mut this.stub_tracker,
                 stream_manager,
@@ -2391,6 +2581,31 @@ impl Player {
         })
     }
 
+    pub fn set_avm2_static_bool(
+        &mut self,
+        class_name: &str,
+        property_name: &str,
+        value: bool,
+    ) -> bool {
+        self.mutate_with_update_context(|context| {
+            let domain = context.avm2.stage_domain();
+            let mut activation = Avm2Activation::from_domain(context, domain);
+            let class_name = AvmString::new_utf8(activation.gc(), class_name);
+            let qname = crate::avm2::QName::from_qualified_name(class_name, activation.context);
+            let Ok(class_value) = domain.get_defined_value(&mut activation, qname) else {
+                return false;
+            };
+            let property = AvmString::new_utf8(activation.gc(), property_name);
+            class_value
+                .set_public_property(
+                    property,
+                    crate::avm2::Value::Bool(value),
+                    &mut activation,
+                )
+                .is_ok()
+        })
+    }
+
     #[cfg(feature = "egui")]
     pub fn show_debug_ui(&mut self, egui_ctx: &egui::Context, movie_offset: f64) {
         // To allow using `mutate_with_update_context` and passing the context inside the debug ui,
@@ -2420,22 +2635,80 @@ impl Player {
     where
         F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
     {
+        let mut queued_actions_us = 0u64;
+        let mut queued_actions = 0u64;
+        let mut queued_profile = VitaQueuedActionProfile::default();
+        let mut queued_opcode_profile = VitaAvm1ActionProfile::default();
         let rval = self.mutate_with_update_context(|context| {
             let rval = func(context);
 
-            Self::run_actions(context);
+            let actions_before = *context.avm1_action_count;
+            let opcode_profile_before = *context.vita_avm1_action_profile;
+            let begin = Instant::now();
+            queued_profile = Self::run_actions(context);
+            queued_actions_us = begin.elapsed().as_micros() as u64;
+            queued_actions = context.avm1_action_count.saturating_sub(actions_before);
+            queued_opcode_profile =
+                (*context.vita_avm1_action_profile).saturating_sub(opcode_profile_before);
 
             rval
         });
+        self.vita_frame_profile.queued_actions_us = self
+            .vita_frame_profile
+            .queued_actions_us
+            .saturating_add(queued_actions_us);
+        self.vita_frame_profile.queued_actions = self
+            .vita_frame_profile
+            .queued_actions
+            .saturating_add(queued_actions);
+        self.vita_frame_profile.queued_items += queued_profile.items;
+        self.vita_frame_profile.queued_normal += queued_profile.normal;
+        self.vita_frame_profile.queued_initialize += queued_profile.initialize;
+        self.vita_frame_profile.queued_construct += queued_profile.construct;
+        self.vita_frame_profile.queued_method += queued_profile.method;
+        self.vita_frame_profile.queued_notify += queued_profile.notify;
+        self.vita_frame_profile.queued_get_member += queued_opcode_profile.get_member;
+        self.vita_frame_profile.queued_set_member += queued_opcode_profile.set_member;
+        self.vita_frame_profile.queued_get_variable += queued_opcode_profile.get_variable;
+        self.vita_frame_profile.queued_set_variable += queued_opcode_profile.set_variable;
+        self.vita_frame_profile.queued_call_function += queued_opcode_profile.call_function;
+        self.vita_frame_profile.queued_call_method += queued_opcode_profile.call_method;
+        self.vita_frame_profile.queued_push += queued_opcode_profile.push;
+        self.vita_frame_profile.queued_movieclip_refs += queued_opcode_profile.movieclip_refs;
+        self.vita_frame_profile.queued_predecode_blocks += queued_profile.predecode_blocks;
+        self.vita_frame_profile.queued_predecode_pushes += queued_profile.predecode_pushes;
+        self.vita_frame_profile.queued_predecode_parallel += queued_profile.predecode_parallel;
+        self.vita_frame_profile.update_calls = self.vita_frame_profile.update_calls.saturating_add(1);
 
         // Update mouse state (check for new hovered button, etc.)
+        let begin = Instant::now();
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
         });
+        let drag_us = begin.elapsed().as_micros() as u64;
+        let begin = Instant::now();
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        let mouse_state_us = begin.elapsed().as_micros() as u64;
+        self.vita_frame_profile.mouse_drag_us = self
+            .vita_frame_profile
+            .mouse_drag_us
+            .saturating_add(drag_us);
+        self.vita_frame_profile.mouse_state_us = self
+            .vita_frame_profile
+            .mouse_state_us
+            .saturating_add(mouse_state_us);
+        self.vita_frame_profile.mouse_us = self
+            .vita_frame_profile
+            .mouse_us
+            .saturating_add(drag_us.saturating_add(mouse_state_us));
 
         // GC
+        let begin = Instant::now();
         self.gc_arena.borrow_mut().collect_debt();
+        self.vita_frame_profile.gc_us = self
+            .vita_frame_profile
+            .gc_us
+            .saturating_add(begin.elapsed().as_micros() as u64);
 
         rval
     }
@@ -3085,6 +3358,9 @@ impl PlayerBuilder {
                 time_til_next_timer: None,
                 max_execution_duration: self.max_execution_duration,
                 actions_since_timeout_check: 0,
+                avm1_action_count: 0,
+                vita_avm1_action_profile: VitaAvm1ActionProfile::default(),
+                vita_frame_profile: VitaFrameProfile::default(),
 
                 // Input
                 input: InputManager::new(self.gamepad_button_mapping),

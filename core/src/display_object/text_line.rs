@@ -347,19 +347,21 @@ impl<'gc> TInteractiveObject<'gc> for TextLine<'gc> {
 
     fn mouse_pick_avm1(
         self,
-        _context: &mut UpdateContext<'gc>,
+        context: &mut UpdateContext<'gc>,
         _point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         None
     }
 
     fn mouse_pick_avm2(
         self,
-        _context: &mut UpdateContext<'gc>,
+        context: &mut UpdateContext<'gc>,
         _point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
+        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
         Avm2MousePick::Miss
     }
 

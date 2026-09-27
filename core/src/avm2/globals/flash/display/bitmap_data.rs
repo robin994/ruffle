@@ -74,6 +74,20 @@ pub fn fill_bitmap_data_from_symbol<'gc>(
     activation: &mut Activation<'_, 'gc>,
     bd: &CompressedBitmap,
 ) -> BitmapData<'gc> {
+    #[cfg(target_os = "vita")]
+    if let CompressedBitmap::Lossless(lossless) = bd {
+        let width = u32::from(lossless.width);
+        let height = u32::from(lossless.height);
+        return BitmapData::new_with_vita_rgba(
+            activation.context.gc_context,
+            width,
+            height,
+            true,
+            |rgba| ruffle_render::utils::decode_define_bits_lossless_into_rgba(lossless, rgba),
+        )
+        .expect("Failed to decode BitmapData");
+    }
+
     let bitmap = bd.decode().expect("Failed to decode BitmapData");
     BitmapData::new_with_pixels(
         activation.context.gc_context,

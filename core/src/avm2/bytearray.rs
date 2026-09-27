@@ -11,6 +11,47 @@ use std::cmp;
 use std::io::prelude::*;
 use std::io::{self, SeekFrom};
 
+#[cfg(target_os = "vita")]
+fn vita_decompress_exact<R1: Read, R2: Read>(
+    mut sizing_reader: R1,
+    mut decode_reader: R2,
+) -> io::Result<Vec<u8>> {
+    const SCRATCH_SIZE: usize = 8 * 1024;
+    let mut scratch = [0u8; SCRATCH_SIZE];
+    let mut exact_len = 0usize;
+
+    loop {
+        let read = sizing_reader.read(&mut scratch)?;
+        if read == 0 {
+            break;
+        }
+        exact_len = exact_len
+            .checked_add(read)
+            .ok_or_else(|| io::Error::other("ByteArray decompressed size overflow"))?;
+        if exact_len > u32::MAX as usize {
+            return Err(io::Error::other("ByteArray decompressed data exceeds 4 GiB"));
+        }
+    }
+
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(exact_len)
+        .map_err(|_| io::Error::other("Not enough memory for exact ByteArray decompression"))?;
+
+    loop {
+        let read = decode_reader.read(&mut scratch)?;
+        if read == 0 {
+            break;
+        }
+        output.extend_from_slice(&scratch[..read]);
+    }
+
+    if output.len() != exact_len {
+        return Err(io::Error::other("ByteArray decompression size changed between passes"));
+    }
+    Ok(output)
+}
+
 #[derive(Clone, Collect, Debug, Copy, PartialEq, Eq)]
 #[collect(no_drop)]
 pub enum Endian {
@@ -58,6 +99,10 @@ pub struct ByteArrayStorage {
     /// Underlying ByteArray
     bytes: Vec<u8>,
 
+    /// Vita low-memory hint: URLLoader archive bytes can be released once a
+    /// consumer copies the complete payload into another ByteArray.
+    transient_url_loader_archive: bool,
+
     /// The current position to read/write from
     position: Cell<usize>,
 
@@ -73,6 +118,7 @@ impl ByteArrayStorage {
     pub fn new(context: &mut UpdateContext<'_>) -> ByteArrayStorage {
         ByteArrayStorage {
             bytes: Vec::new(),
+            transient_url_loader_archive: false,
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
@@ -83,9 +129,29 @@ impl ByteArrayStorage {
     pub fn from_vec(context: &mut UpdateContext<'_>, bytes: Vec<u8>) -> ByteArrayStorage {
         ByteArrayStorage {
             bytes,
+            transient_url_loader_archive: false,
             position: Cell::new(0),
             endian: Endian::Big,
             object_encoding: context.avm2.default_bytearray_encoding,
+        }
+    }
+
+    pub fn mark_transient_url_loader_archive(&mut self) {
+        self.transient_url_loader_archive = true;
+    }
+
+    pub fn can_release_transient_archive_after_copy(&self, offset: usize, amount: usize) -> bool {
+        self.transient_url_loader_archive
+            && amount > 0
+            && offset <= self.bytes.len()
+            && offset.saturating_add(amount) >= self.bytes.len()
+    }
+
+    pub fn release_transient_archive(&mut self) {
+        if self.transient_url_loader_archive {
+            self.bytes = Vec::new();
+            self.position.set(0);
+            self.transient_url_loader_archive = false;
         }
     }
 
@@ -225,6 +291,41 @@ impl ByteArrayStorage {
 
     /// Decompress the ByteArray into a temporary buffer.
     pub fn decompress(&mut self, algorithm: CompressionAlgorithm) -> Option<Vec<u8>> {
+        #[cfg(target_os = "vita")]
+        {
+            let result = match algorithm {
+                CompressionAlgorithm::Zlib => vita_decompress_exact(
+                    ZlibDecoder::new(&*self.bytes),
+                    ZlibDecoder::new(&*self.bytes),
+                ),
+                CompressionAlgorithm::Deflate => vita_decompress_exact(
+                    DeflateDecoder::new(&*self.bytes),
+                    DeflateDecoder::new(&*self.bytes),
+                ),
+                #[cfg(feature = "lzma")]
+                CompressionAlgorithm::Lzma => {
+                    let mut buffer = Vec::new();
+                    lzma_rs::lzma_decompress(&mut &*self.bytes, &mut buffer)
+                        .map(|_| buffer)
+                        .map_err(|error| io::Error::other(error.to_string()))
+                }
+                #[cfg(not(feature = "lzma"))]
+                CompressionAlgorithm::Lzma => {
+                    Err(io::Error::other("Ruffle was not compiled with LZMA support"))
+                }
+            };
+
+            return match result {
+                Ok(buffer) => Some(buffer),
+                Err(error) => {
+                    tracing::warn!("ByteArray.decompress: {}", error);
+                    None
+                }
+            };
+        }
+
+        #[cfg(not(target_os = "vita"))]
+        {
         let mut buffer = Vec::new();
         let error: Option<Box<dyn std::error::Error>> = match algorithm {
             CompressionAlgorithm::Zlib => {
@@ -247,6 +348,7 @@ impl ByteArrayStorage {
             None
         } else {
             Some(buffer)
+        }
         }
     }
 

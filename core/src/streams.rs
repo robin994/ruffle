@@ -133,6 +133,11 @@ impl<'gc> StreamManager<'gc> {
             stream.tick(context, dt)
         }
     }
+
+    #[cfg(target_os = "vita")]
+    pub fn vita_active_count(&self) -> usize {
+        self.active_streams.len()
+    }
 }
 
 #[derive(Copy, Clone, Collect, Debug)]
