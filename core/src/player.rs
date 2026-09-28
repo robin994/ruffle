@@ -2484,9 +2484,15 @@ impl Player {
             // Decode all immutable bytecode blocks currently in the queue in one
             // batch so CPU1/CPU2 can prepare the compact IR before CPU0 enters
             // the serial AVM1 execution loop.
-            let blocks = context.action_queue.vita_bytecode_blocks();
-            let (decoded_blocks, decoded_pushes, parallel) =
-                context.avm1.vita_predecode_blocks(&blocks);
+            let (decoded_blocks, decoded_pushes, parallel) = if context
+                .action_queue
+                .vita_has_bytecode_actions()
+            {
+                let blocks = context.action_queue.vita_bytecode_blocks();
+                context.avm1.vita_predecode_blocks(&blocks)
+            } else {
+                (0, 0, false)
+            };
             #[cfg(feature = "vita-profile")]
             {
                 profile.predecode_blocks = decoded_blocks as u64;

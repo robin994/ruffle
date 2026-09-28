@@ -44,6 +44,12 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     #[inline]
     pub fn contains_avm_string(&self, key: AvmString<'gc>, case_sensitive: bool) -> bool {
+        if case_sensitive
+            && let Some(atom) = key.as_interned()
+            && self.atom_index.contains_key(&atom)
+        {
+            return true;
+        }
         self.contains_key(key, case_sensitive)
     }
 
@@ -54,7 +60,14 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     pub fn entry<'a>(&'a mut self, key: AvmString<'gc>, case_sensitive: bool) -> Entry<'gc, 'a, V> {
         if case_sensitive {
-            match self.ordered.get_index_of(&CaseSensitive(key.as_ref())) {
+            let atom = key.as_interned();
+            let index = atom
+                .and_then(|atom| self.atom_index.get(&atom).copied())
+                .or_else(|| self.ordered.get_index_of(&CaseSensitive(key.as_ref())));
+            if let (Some(atom), Some(index)) = (atom, index) {
+                self.atom_index.insert(atom, index);
+            }
+            match index {
                 Some(index) => Entry::Occupied(OccupiedEntry {
                     map: &mut self.ordered,
                     atom_index: &mut self.atom_index,
@@ -93,7 +106,28 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     #[inline]
     pub fn get_avm_string(&self, key: AvmString<'gc>, case_sensitive: bool) -> Option<&V> {
+        if case_sensitive
+            && let Some(atom) = key.as_interned()
+            && let Some(value) = self.get_interned(atom)
+        {
+            return Some(value);
+        }
         self.get(key, case_sensitive)
+    }
+
+    #[inline]
+    pub fn get_avm_string_mut(
+        &mut self,
+        key: AvmString<'gc>,
+        case_sensitive: bool,
+    ) -> Option<&mut V> {
+        if case_sensitive
+            && let Some(atom) = key.as_interned()
+            && self.atom_index.contains_key(&atom)
+        {
+            return self.get_interned_mut(atom);
+        }
+        self.get_mut(key, case_sensitive)
     }
 
     #[inline]
@@ -145,10 +179,23 @@ impl<'gc, V> PropertyMap<'gc, V> {
 
     pub fn remove<T: AsRef<WStr>>(&mut self, key: T, case_sensitive: bool) -> Option<V> {
         // Note that we must use shift_remove to maintain order in case this object is enumerated.
-        if case_sensitive {
+        let removed = if case_sensitive {
             self.ordered.shift_remove(&CaseSensitive(key.as_ref()))
         } else {
             self.ordered.shift_remove(&CaseInsensitive(key.as_ref()))
+        };
+        if removed.is_some() {
+            self.rebuild_atom_index();
+        }
+        removed
+    }
+
+    fn rebuild_atom_index(&mut self) {
+        self.atom_index.clear();
+        for (index, (name, _)) in self.ordered.iter().enumerate() {
+            if let Some(atom) = name.0.as_interned() {
+                self.atom_index.insert(atom, index);
+            }
         }
     }
 }
@@ -167,6 +214,12 @@ pub struct OccupiedEntry<'gc, 'a, V> {
 impl<'gc, V> OccupiedEntry<'gc, '_, V> {
     pub fn remove_entry(&mut self) -> (AvmString<'gc>, V) {
         let (k, v) = self.map.shift_remove_index(self.index).unwrap();
+        self.atom_index.clear();
+        for (index, (name, _)) in self.map.iter().enumerate() {
+            if let Some(atom) = name.0.as_interned() {
+                self.atom_index.insert(atom, index);
+            }
+        }
         (k.0, v)
     }
 
@@ -191,6 +244,10 @@ pub struct VacantEntry<'gc, 'a, V> {
 
 impl<V> VacantEntry<'_, '_, V> {
     pub fn insert(self, value: V) {
+        let index = self.map.len();
+        if let Some(atom) = self.key.as_interned() {
+            self.atom_index.insert(atom, index);
+        }
         self.map.insert(PropertyName(self.key), value);
     }
 }

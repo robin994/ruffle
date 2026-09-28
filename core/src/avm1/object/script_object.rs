@@ -175,7 +175,7 @@ impl<'gc> Object<'gc> {
         self.0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .map(|property| property.data())
     }
 
@@ -237,7 +237,7 @@ impl<'gc> Object<'gc> {
         let read = self.0.borrow();
 
         read.properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .filter(|property| property.allow_swf_version(activation.swf_version()))
             .map(|property| property.data())
             .or_else(|| {
@@ -297,7 +297,7 @@ impl<'gc> Object<'gc> {
             .0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .map_or((0, None), |v| (v.id(), v.setter()));
 
         if let Some(setter) = setter
@@ -400,7 +400,7 @@ impl<'gc> Object<'gc> {
             .0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .filter(|property| property.allow_swf_version(activation.swf_version()))
             .map_or((0, None), |v| (v.id(), v.getter()));
 
@@ -441,7 +441,7 @@ impl<'gc> Object<'gc> {
             .0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .filter(|property| property.allow_swf_version(activation.swf_version()))
             .map_or((0, None), |v| (v.id(), v.setter()));
 
@@ -570,7 +570,7 @@ impl<'gc> Object<'gc> {
             .0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .map(|p| p.id())
             .unwrap_or_default();
 
@@ -578,7 +578,7 @@ impl<'gc> Object<'gc> {
             .0
             .borrow()
             .watchers
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .cloned();
 
         if let Some(watcher) = watcher {
@@ -779,7 +779,7 @@ impl<'gc> Object<'gc> {
         self.0
             .borrow()
             .properties
-            .contains_key(name, activation.is_case_sensitive())
+            .contains_avm_string(name, activation.is_case_sensitive())
     }
 
     /// Checks if the object has a given named property on itself that is
@@ -798,7 +798,7 @@ impl<'gc> Object<'gc> {
         self.0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .is_some_and(|property| {
                 property.is_virtual() && property.allow_swf_version(activation.swf_version())
             })
@@ -819,7 +819,7 @@ impl<'gc> Object<'gc> {
         self.0
             .borrow()
             .properties
-            .get(name, activation.is_case_sensitive())
+            .get_avm_string(name, activation.is_case_sensitive())
             .is_some_and(|property| property.is_enumerable())
     }
 

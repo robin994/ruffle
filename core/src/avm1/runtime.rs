@@ -831,9 +831,13 @@ impl<'gc> Avm1<'gc> {
             return;
         }
 
-        let name_utf8 = &name.to_utf8_lossy();
-        let mut activation =
-            Activation::from_nothing(context, ActivationIdentifier::root(name_utf8), active_clip);
+        #[cfg(target_os = "vita")]
+        let identifier = ActivationIdentifier::root("[Method]");
+        #[cfg(not(target_os = "vita"))]
+        let name_utf8 = name.to_utf8_lossy();
+        #[cfg(not(target_os = "vita"))]
+        let identifier = ActivationIdentifier::root(&name_utf8);
+        let mut activation = Activation::from_nothing(context, identifier, active_clip);
 
         let _ = obj.call_method(name, args, &mut activation, ExecutionReason::Special);
     }

@@ -560,6 +560,8 @@ pub enum ActionPriority {
 pub struct ActionQueue<'gc> {
     /// Each priority is kept in a separate bucket.
     action_queue: EnumMap<ActionPriority, VecDeque<QueuedAction<'gc>>>,
+    #[cfg(target_os = "vita")]
+    vita_bytecode_actions: usize,
 }
 
 impl<'gc> ActionQueue<'gc> {
@@ -569,6 +571,8 @@ impl<'gc> ActionQueue<'gc> {
     pub fn new() -> Self {
         Self {
             action_queue: EnumMap::from_fn(|_| VecDeque::with_capacity(Self::DEFAULT_CAPACITY)),
+            #[cfg(target_os = "vita")]
+            vita_bytecode_actions: 0,
         }
     }
 
@@ -581,6 +585,13 @@ impl<'gc> ActionQueue<'gc> {
         is_unload: bool,
     ) {
         let priority = action_type.priority();
+        #[cfg(target_os = "vita")]
+        if !matches!(
+            &action_type,
+            ActionType::Method { .. } | ActionType::NotifyListeners { .. }
+        ) {
+            self.vita_bytecode_actions = self.vita_bytecode_actions.saturating_add(1);
+        }
         let queue = &mut self.action_queue[priority];
 
         queue.push_back(QueuedAction {
@@ -592,10 +603,26 @@ impl<'gc> ActionQueue<'gc> {
 
     /// Sorts and drains the actions from the queue.
     pub fn pop_action(&mut self) -> Option<QueuedAction<'gc>> {
-        // The correct order of iteration of `EnumMap::iter_mut` is guaranteed by the comment on the `enum_map::Enum` macro.
-        self.action_queue
-            .iter_mut()
-            .find_map(|(_, v)| v.pop_front())
+        let action = self.action_queue[ActionPriority::Initialize]
+            .pop_front()
+            .or_else(|| self.action_queue[ActionPriority::Construct].pop_front())
+            .or_else(|| self.action_queue[ActionPriority::Default].pop_front());
+        #[cfg(target_os = "vita")]
+        if let Some(action) = &action
+            && !matches!(
+                &action.action_type,
+                ActionType::Method { .. } | ActionType::NotifyListeners { .. }
+            )
+        {
+            self.vita_bytecode_actions = self.vita_bytecode_actions.saturating_sub(1);
+        }
+        action
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub fn vita_has_bytecode_actions(&self) -> bool {
+        self.vita_bytecode_actions != 0
     }
 
     #[cfg(target_os = "vita")]
