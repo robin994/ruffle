@@ -545,7 +545,8 @@ impl<'gc> TInteractiveObject<'gc> for Avm1Button<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
-        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
+        #[cfg(feature = "vita-profile")]
+        { *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1); }
         // The button is hovered if the mouse is over any child nodes.
         if self.visible() && self.mouse_enabled() {
             for child in self.iter_render_list().rev() {
@@ -572,7 +573,10 @@ impl<'gc> TInteractiveObject<'gc> for Avm1Button<'gc> {
         _point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
-        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
+        #[cfg(not(feature = "vita-profile"))]
+        let _ = context;
+        #[cfg(feature = "vita-profile")]
+        { *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1); }
         Avm2MousePick::Miss
     }
 

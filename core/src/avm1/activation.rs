@@ -4,7 +4,7 @@ use crate::avm1::function::{Avm1Function, ExecutionReason, FunctionObject};
 use crate::avm1::property::Attribute;
 use crate::avm1::runtime::skip_actions;
 #[cfg(target_os = "vita")]
-use crate::avm1::runtime::VitaPushOperand;
+use crate::avm1::runtime::{VITA_IR_INVALID_SLOT, VitaIrOp, VitaPushOperand};
 use crate::avm1::scope::{Scope, ScopeClass};
 use crate::avm1::{ArrayBuilder, Object, Value, fscommand, globals, scope};
 use crate::backend::navigator::{NavigationMethod, Request};
@@ -505,11 +505,46 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     pub fn run_actions(&mut self, code: SwfSlice) -> Result<ReturnType<'gc>, Error<'gc>> {
         let mut read = Reader::new(&code.movie.data()[code.start..], self.swf_version());
 
+        #[cfg(target_os = "vita")]
+        let ir = self.context.avm1.vita_ir_block(&code);
+        #[cfg(target_os = "vita")]
+        let mut ir_index = 0usize;
+
         loop {
-            let result = self.do_action(&code, &mut read);
+            #[cfg(target_os = "vita")]
+            let predecoded = {
+                let absolute_offset = read.get_ref().as_ptr() as usize
+                    - code.movie.data().as_ptr() as usize;
+                while ir_index < ir.len() && (ir[ir_index].offset as usize) < absolute_offset {
+                    ir_index += 1;
+                }
+                if ir_index < ir.len() && ir[ir_index].offset as usize == absolute_offset {
+                    Some(ir[ir_index])
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(target_os = "vita"))]
+            let predecoded = ();
+
+            let result = self.do_action(&code, &mut read, predecoded);
             match result {
                 Ok(FrameControl::Return(return_type)) => break Ok(return_type),
-                Ok(FrameControl::Continue) => {}
+                Ok(FrameControl::Continue) => {
+                    #[cfg(target_os = "vita")]
+                    if let Some(op) = predecoded {
+                        let next_offset = read.get_ref().as_ptr() as usize
+                            - code.movie.data().as_ptr() as usize;
+                        let sequential = op.offset as usize + op.total_len as usize;
+                        if next_offset == sequential {
+                            ir_index = ir_index.saturating_add(1);
+                        } else {
+                            ir_index = ir
+                                .binary_search_by_key(&(next_offset as u32), |candidate| candidate.offset)
+                                .unwrap_or_else(|index| index);
+                        }
+                    }
+                }
                 Err(e) => break Err(e),
             }
         }
@@ -520,9 +555,14 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         data: &'b SwfSlice,
         reader: &mut Reader<'b>,
+        #[cfg(target_os = "vita")] predecoded: Option<VitaIrOp>,
+        #[cfg(not(target_os = "vita"))] _predecoded: (),
     ) -> Result<FrameControl<'gc>, Error<'gc>> {
         *self.context.actions_since_timeout_check += 1;
-        *self.context.avm1_action_count += 1;
+        #[cfg(feature = "vita-profile")]
+        {
+            *self.context.avm1_action_count += 1;
+        }
         if *self.context.actions_since_timeout_check >= 2000 {
             *self.context.actions_since_timeout_check = 0;
             if self.context.update_start.elapsed() >= self.context.max_execution_duration {
@@ -534,18 +574,26 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             //Executing beyond the end of a function constitutes an implicit return.
             Ok(FrameControl::Return(ReturnType::Implicit))
         } else {
+            #[cfg(target_os = "vita")]
+            if let Some(result) = self.try_vita_fast_action(data, reader, predecoded) {
+                return result;
+            }
+
             let action = reader.read_action()?;
 
-            let vita_profile = &mut *self.context.vita_avm1_action_profile;
-            match &action {
-                Action::GetMember => vita_profile.get_member += 1,
-                Action::SetMember => vita_profile.set_member += 1,
-                Action::GetVariable => vita_profile.get_variable += 1,
-                Action::SetVariable => vita_profile.set_variable += 1,
-                Action::CallFunction => vita_profile.call_function += 1,
-                Action::CallMethod => vita_profile.call_method += 1,
-                Action::Push(_) => vita_profile.push += 1,
-                _ => {}
+            #[cfg(feature = "vita-profile")]
+            {
+                let vita_profile = &mut *self.context.vita_avm1_action_profile;
+                match &action {
+                    Action::GetMember => vita_profile.get_member += 1,
+                    Action::SetMember => vita_profile.set_member += 1,
+                    Action::GetVariable => vita_profile.get_variable += 1,
+                    Action::SetVariable => vita_profile.set_variable += 1,
+                    Action::CallFunction => vita_profile.call_function += 1,
+                    Action::CallMethod => vita_profile.call_method += 1,
+                    Action::Push(_) => vita_profile.push += 1,
+                    _ => {}
+                }
             }
 
             avm_debug!(
@@ -666,12 +714,85 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         data: &'b SwfSlice,
         reader: &mut Reader<'b>,
+        predecoded: Option<VitaIrOp>,
     ) -> Option<Result<FrameControl<'gc>, Error<'gc>>> {
         let input = reader.get_ref();
-        let opcode = *input.first()?;
+        let opcode = predecoded.map(|op| op.opcode).or_else(|| input.first().copied())?;
 
         if opcode == 0x96 {
-            return self.try_vita_fast_push(data, reader);
+            return self.try_vita_fast_push(data, reader, predecoded);
+        }
+
+        if let Some(op) = predecoded {
+            let total_len = op.total_len as usize;
+            if total_len > input.len() {
+                return None;
+            }
+
+            match opcode {
+                // ConstantPool is decoded once into interned AVM strings and then
+                // addressed by a compact slot instead of reparsing SWF strings.
+                0x88 if op.constant_pool_slot != VITA_IR_INVALID_SLOT && total_len >= 5 => {
+                    let pool = if let Some(pool) = self
+                        .context
+                        .avm1
+                        .vita_constant_pool_slot(op.constant_pool_slot)
+                    {
+                        pool
+                    } else {
+                        let payload = &input[3..total_len];
+                        let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                        let mut pos = 2usize;
+                        let mut constants = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            let rel = payload.get(pos..)?.iter().position(|&byte| byte == 0)?;
+                            let swf_string = swf::SwfStr::from_bytes(&payload[pos..pos + rel]);
+                            let string = AvmString::from(
+                                self.context.strings.intern(AvmString::new(
+                                    self.gc(),
+                                    swf_string.decode(self.encoding()),
+                                )),
+                            );
+                            constants.push(Value::from(string));
+                            pos += rel + 1;
+                        }
+                        let pool = Gc::new(self.gc(), constants);
+                        self.context
+                            .avm1
+                            .vita_cache_constant_pool_slot(op.constant_pool_slot, pool);
+                        pool
+                    };
+                    self.context.avm1.set_constant_pool(pool);
+                    self.set_constant_pool(pool);
+                    *reader.get_mut() = &input[total_len..];
+                    return Some(Ok(FrameControl::Continue));
+                }
+                // Jump/If targets are resolved by the predecoder, so the hot
+                // interpreter never reparses the signed branch displacement.
+                0x99 if op.branch_target != VITA_IR_INVALID_SLOT => {
+                    let movie = data.movie.data();
+                    let target = op.branch_target as usize;
+                    if target > movie.len() {
+                        return None;
+                    }
+                    *reader.get_mut() = &movie[target..];
+                    return Some(Ok(FrameControl::Continue));
+                }
+                0x9D if op.branch_target != VITA_IR_INVALID_SLOT => {
+                    if self.context.avm1.pop().as_bool(self.swf_version()) {
+                        let movie = data.movie.data();
+                        let target = op.branch_target as usize;
+                        if target > movie.len() {
+                            return None;
+                        }
+                        *reader.get_mut() = &movie[target..];
+                    } else {
+                        *reader.get_mut() = &input[total_len..];
+                    }
+                    return Some(Ok(FrameControl::Continue));
+                }
+                _ => {}
+            }
         }
 
         let result = match opcode {
@@ -690,11 +811,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             0x17 => self.action_pop(),
             0x18 => self.action_to_integer(),
             0x1C => {
-                self.context.vita_avm1_action_profile.get_variable += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.get_variable += 1;
+                }
                 self.action_get_variable()
             }
             0x1D => {
-                self.context.vita_avm1_action_profile.set_variable += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.set_variable += 1;
+                }
                 self.action_set_variable()
             }
             0x21 => self.action_string_add(),
@@ -708,7 +835,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             0x3B => self.action_delete_2(),
             0x3C => self.action_define_local(),
             0x3D => {
-                self.context.vita_avm1_action_profile.call_function += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.call_function += 1;
+                }
                 self.action_call_function()
             }
             0x3E => self.action_return(),
@@ -727,17 +857,26 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             0x4C => self.action_push_duplicate(),
             0x4D => self.action_stack_swap(),
             0x4E => {
-                self.context.vita_avm1_action_profile.get_member += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.get_member += 1;
+                }
                 self.action_get_member()
             }
             0x4F => {
-                self.context.vita_avm1_action_profile.set_member += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.set_member += 1;
+                }
                 self.action_set_member()
             }
             0x50 => self.action_increment(),
             0x51 => self.action_decrement(),
             0x52 => {
-                self.context.vita_avm1_action_profile.call_method += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.call_method += 1;
+                }
                 self.action_call_method()
             }
             0x53 => self.action_new_method(),
@@ -765,13 +904,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         &mut self,
         data: &'b SwfSlice,
         reader: &mut Reader<'b>,
+        predecoded: Option<VitaIrOp>,
     ) -> Option<Result<FrameControl<'gc>, Error<'gc>>> {
         let input = reader.get_ref();
         if input.len() < 3 || input[0] != 0x96 {
             return None;
         }
 
-        let payload_len = u16::from_le_bytes([input[1], input[2]]) as usize;
+        let payload_len = predecoded
+            .filter(|op| op.opcode == 0x96)
+            .map(|op| op.push_len as usize)
+            .unwrap_or_else(|| u16::from_le_bytes([input[1], input[2]]) as usize);
         let end = 3usize.checked_add(payload_len)?;
         if end > input.len() {
             return None;
@@ -782,8 +925,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let action_offset = (input.as_ptr() as usize)
             .saturating_sub(data.movie.data().as_ptr() as usize);
 
-        if let Some(plan) = self.context.avm1.vita_push_plan(movie_key, action_offset) {
-            self.context.vita_avm1_action_profile.push += 1;
+        let push_slot = predecoded
+            .map(|op| op.push_slot)
+            .filter(|slot| *slot != VITA_IR_INVALID_SLOT);
+        let cached_plan = push_slot
+            .and_then(|slot| self.context.avm1.vita_push_plan_slot(slot))
+            .or_else(|| self.context.avm1.vita_push_plan(movie_key, action_offset));
+        if let Some(plan) = cached_plan {
+            #[cfg(feature = "vita-profile")]
+            {
+                self.context.vita_avm1_action_profile.push += 1;
+            }
             for operand in plan {
                 let value = match operand {
                     VitaPushOperand::Static(value) => value,
@@ -842,7 +994,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             );
         }
 
-        self.context.vita_avm1_action_profile.push += 1;
+        #[cfg(feature = "vita-profile")]
+        {
+            self.context.vita_avm1_action_profile.push += 1;
+        }
         let mut plan = Vec::new();
         let mut pos = 0usize;
         while pos < payload.len() {
@@ -944,9 +1099,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             self.stack_push(value);
         }
 
-        self.context
-            .avm1
-            .vita_cache_push_plan(movie_key, action_offset, plan);
+        if let Some(slot) = push_slot {
+            self.context.avm1.vita_cache_push_plan_slot(slot, plan);
+        } else {
+            self.context
+                .avm1
+                .vita_cache_push_plan(movie_key, action_offset, plan);
+        }
 
         *reader.get_mut() = &input[end..];
         Some(Ok(FrameControl::Continue))
@@ -963,7 +1122,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             // can refer to a MovieClip
             // There is a ignored test for this issue of "reference laundering" at "avm1/string_paths_reference_launder"
             if let Some(mcr) = MovieClipReference::try_from_stage_object(self, obj) {
-                self.context.vita_avm1_action_profile.movieclip_refs += 1;
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.context.vita_avm1_action_profile.movieclip_refs += 1;
+                }
                 value = Value::MovieClip(mcr);
             }
         }

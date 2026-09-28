@@ -65,6 +65,8 @@ use enumset::EnumSet;
 use fnv::FnvHashSet;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, DynamicRootSet, Mutation, Rootable};
+#[cfg(target_os = "vita")]
+use gc_arena::metrics::Pacing;
 use ruffle_common::duration::FloatDuration;
 use ruffle_macros::istr;
 use ruffle_render::backend::{RenderBackend, ViewportDimensions, null::NullRenderer};
@@ -335,6 +337,9 @@ pub struct Player {
 
     run_state: RunState,
     needs_render: bool,
+
+    #[cfg(target_os = "vita")]
+    vita_gc_tick_counter: u32,
 
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
@@ -623,7 +628,10 @@ impl Player {
             return;
         }
 
-        self.vita_frame_profile = VitaFrameProfile::default();
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile = VitaFrameProfile::default();
+        }
 
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
@@ -683,28 +691,48 @@ impl Player {
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
+        #[cfg(feature = "vita-profile")]
         let phase_begin = Instant::now();
         self.update_sockets();
-        self.vita_frame_profile.sockets_us = phase_begin.elapsed().as_micros() as u64;
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.sockets_us = phase_begin.elapsed().as_micros() as u64;
+        }
 
+        #[cfg(feature = "vita-profile")]
         let phase_begin = Instant::now();
         self.update_net_connections();
-        self.vita_frame_profile.net_us = phase_begin.elapsed().as_micros() as u64;
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.net_us = phase_begin.elapsed().as_micros() as u64;
+        }
 
+        #[cfg(feature = "vita-profile")]
         let timer_actions_before = self.avm1_action_count;
+        #[cfg(feature = "vita-profile")]
         let phase_begin = Instant::now();
         self.update_timers(dt);
-        self.vita_frame_profile.timers_us = phase_begin.elapsed().as_micros() as u64;
-        self.vita_frame_profile.timer_actions = self
-            .avm1_action_count
-            .saturating_sub(timer_actions_before);
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.timers_us = phase_begin.elapsed().as_micros() as u64;
+        }
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.timer_actions = self
+                .avm1_action_count
+                .saturating_sub(timer_actions_before);
+        }
 
+        #[cfg(feature = "vita-profile")]
         let phase_begin = Instant::now();
+        #[cfg(feature = "vita-profile")]
         let mut stream_body_us = 0u64;
+        #[cfg(feature = "vita-profile")]
         let mut stream_active = 0u64;
+        #[cfg(feature = "vita-profile")]
         let mut stream_queued = 0u64;
         self.update(|context| {
-            #[cfg(target_os = "vita")]
+            #[cfg(all(target_os = "vita", feature = "vita-profile"))]
             {
                 stream_active = context.stream_manager.vita_active_count() as u64;
                 let queued_before = context.action_queue.vita_len();
@@ -716,17 +744,54 @@ impl Player {
                     .vita_len()
                     .saturating_sub(queued_before) as u64;
             }
-            #[cfg(not(target_os = "vita"))]
+            #[cfg(not(all(target_os = "vita", feature = "vita-profile")))]
             StreamManager::tick(context, dt);
         });
-        self.vita_frame_profile.stream_us = phase_begin.elapsed().as_micros() as u64;
-        self.vita_frame_profile.stream_body_us = stream_body_us;
-        self.vita_frame_profile.stream_active = stream_active;
-        self.vita_frame_profile.stream_queued = stream_queued;
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.stream_us = phase_begin.elapsed().as_micros() as u64;
+        }
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.stream_body_us = stream_body_us;
+        }
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.stream_active = stream_active;
+        }
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.stream_queued = stream_queued;
+        }
 
+        #[cfg(feature = "vita-profile")]
         let phase_begin = Instant::now();
         self.audio.tick();
-        self.vita_frame_profile.audio_tick_us = phase_begin.elapsed().as_micros() as u64;
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile.audio_tick_us = phase_begin.elapsed().as_micros() as u64;
+        }
+
+        // Vita: only spend GC time when the previous host tick left useful
+        // vblank headroom. Every fourth tick is a safety valve so sustained
+        // CPU-bound games still retire debt and cannot starve the collector.
+        #[cfg(target_os = "vita")]
+        {
+            self.vita_gc_tick_counter = self.vita_gc_tick_counter.wrapping_add(1);
+            let gc_budget_available =
+                dt.as_millis() <= 12.0 || (self.vita_gc_tick_counter & 3) == 0;
+            if gc_budget_available {
+                #[cfg(feature = "vita-profile")]
+                let gc_begin = Instant::now();
+                self.gc_arena.borrow_mut().collect_debt();
+                #[cfg(feature = "vita-profile")]
+                {
+                    self.vita_frame_profile.gc_us = gc_begin.elapsed().as_micros() as u64;
+                }
+            }
+        }
+        #[cfg(not(target_os = "vita"))]
+        self.gc_arena.borrow_mut().collect_debt();
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -2007,9 +2072,12 @@ impl Player {
             let needs_render = if events.is_empty() {
                 false
             } else {
-                *context.vita_mouse_event_dispatches = context
-                    .vita_mouse_event_dispatches
-                    .saturating_add(events.len() as u64);
+                #[cfg(feature = "vita-profile")]
+                {
+                    *context.vita_mouse_event_dispatches = context
+                        .vita_mouse_event_dispatches
+                        .saturating_add(events.len() as u64);
+                }
                 let mut refresh = false;
                 for (object, event) in events {
                     let display_object = object.as_displayobject();
@@ -2046,11 +2114,15 @@ impl Player {
                 new_cursor = forced;
             }
 
+            #[cfg(feature = "vita-profile")]
             let mouse_actions_before = *context.avm1_action_count;
             Self::run_actions(context);
-            *context.vita_mouse_actions = context
-                .vita_mouse_actions
-                .saturating_add(context.avm1_action_count.saturating_sub(mouse_actions_before));
+            #[cfg(feature = "vita-profile")]
+            {
+                *context.vita_mouse_actions = context
+                    .vita_mouse_actions
+                    .saturating_add(context.avm1_action_count.saturating_sub(mouse_actions_before));
+            }
             needs_render
         });
 
@@ -2168,6 +2240,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        #[cfg(feature = "vita-profile")]
         let preload_begin = Instant::now();
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
@@ -2183,24 +2256,37 @@ impl Player {
             LoadBehavior::Blocking => (ExecutionLimit::none(), false),
         };
         let preload_finished = self.preload(&mut execution_limit);
+        #[cfg(feature = "vita-profile")]
         let preload_us = preload_begin.elapsed().as_micros() as u64;
 
         if !preload_finished && !may_execute_while_streaming {
-            self.vita_frame_profile = VitaFrameProfile {
-                preload_us,
-                ..self.vita_frame_profile
-            };
+            #[cfg(feature = "vita-profile")]
+            {
+                self.vita_frame_profile = VitaFrameProfile {
+                    preload_us,
+                    ..self.vita_frame_profile
+                };
+            }
             return;
         }
 
+        #[cfg(feature = "vita-profile")]
         let mut avm2_us = 0;
+        #[cfg(feature = "vita-profile")]
         let mut avm1_us = 0;
+        #[cfg(feature = "vita-profile")]
         let mut audio_us = 0;
+        #[cfg(feature = "vita-profile")]
         let mut local_connections_us = 0;
+        #[cfg(feature = "vita-profile")]
         let mut callbacks_us = 0;
+        #[cfg(feature = "vita-profile")]
         let mut avm1_actions = 0;
+        #[cfg(feature = "vita-profile")]
         let mut avm1_profile = VitaAvm1ActionProfile::default();
         self.update(|context| {
+            #[cfg(feature = "vita-profile")]
+            {
             // TODO: Is this order correct?
             let begin = Instant::now();
             run_all_phases_avm2(context);
@@ -2229,25 +2315,40 @@ impl Player {
                 (cb.callback)(context, cb.data);
             }
             callbacks_us = begin.elapsed().as_micros() as u64;
+            }
+
+            #[cfg(not(feature = "vita-profile"))]
+            {
+                run_all_phases_avm2(context);
+                Avm1::run_frame(context);
+                AudioManager::update_sounds(context);
+                LocalConnections::update_connections(context);
+                for cb in std::mem::take(context.post_frame_callbacks) {
+                    (cb.callback)(context, cb.data);
+                }
+            }
         });
 
-        self.vita_frame_profile = VitaFrameProfile {
-            preload_us,
-            avm2_us,
-            avm1_us,
-            audio_us,
-            local_connections_us,
-            callbacks_us,
-            avm1_actions,
-            avm1_get_member: avm1_profile.get_member,
-            avm1_set_member: avm1_profile.set_member,
-            avm1_get_variable: avm1_profile.get_variable,
-            avm1_set_variable: avm1_profile.set_variable,
-            avm1_call_function: avm1_profile.call_function,
-            avm1_call_method: avm1_profile.call_method,
-            avm1_push: avm1_profile.push,
-            ..self.vita_frame_profile
-        };
+        #[cfg(feature = "vita-profile")]
+        {
+            self.vita_frame_profile = VitaFrameProfile {
+                preload_us,
+                avm2_us,
+                avm1_us,
+                audio_us,
+                local_connections_us,
+                callbacks_us,
+                avm1_actions,
+                avm1_get_member: avm1_profile.get_member,
+                avm1_set_member: avm1_profile.set_member,
+                avm1_get_variable: avm1_profile.get_variable,
+                avm1_set_variable: avm1_profile.set_variable,
+                avm1_call_function: avm1_profile.call_function,
+                avm1_call_method: avm1_profile.call_method,
+                avm1_push: avm1_profile.push,
+                ..self.vita_frame_profile
+            };
+        }
 
         self.needs_render = true;
     }
@@ -2373,9 +2474,33 @@ impl Player {
     }
 
     pub fn run_actions(context: &mut UpdateContext<'_>) -> VitaQueuedActionProfile {
+        #[cfg(feature = "vita-profile")]
         let mut profile = VitaQueuedActionProfile::default();
+        #[cfg(not(feature = "vita-profile"))]
+        let profile = VitaQueuedActionProfile::default();
+
+        #[cfg(target_os = "vita")]
+        {
+            // Decode all immutable bytecode blocks currently in the queue in one
+            // batch so CPU1/CPU2 can prepare the compact IR before CPU0 enters
+            // the serial AVM1 execution loop.
+            let blocks = context.action_queue.vita_bytecode_blocks();
+            let (decoded_blocks, decoded_pushes, parallel) =
+                context.avm1.vita_predecode_blocks(&blocks);
+            #[cfg(feature = "vita-profile")]
+            {
+                profile.predecode_blocks = decoded_blocks as u64;
+                profile.predecode_pushes = decoded_pushes as u64;
+                profile.predecode_parallel = u64::from(parallel);
+            }
+            #[cfg(not(feature = "vita-profile"))]
+            let _ = (decoded_blocks, decoded_pushes, parallel);
+        }
+
         // Note that actions can queue further actions, so a while loop is necessary here.
         while let Some(action) = context.action_queue.pop_action() {
+            #[cfg(feature = "vita-profile")]
+            {
             profile.items += 1;
             match &action.action_type {
                 ActionType::Normal { .. } => profile.normal += 1,
@@ -2383,6 +2508,7 @@ impl Player {
                 ActionType::Construct { .. } => profile.construct += 1,
                 ActionType::Method { .. } => profile.method += 1,
                 ActionType::NotifyListeners { .. } => profile.notify += 1,
+            }
             }
             // We don't run frame actions if the clip was removed (or scheduled to be removed) after it queued the action.
             if !action.is_unload
@@ -2635,13 +2761,19 @@ impl Player {
     where
         F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
     {
+        #[cfg(feature = "vita-profile")]
         let mut queued_actions_us = 0u64;
+        #[cfg(feature = "vita-profile")]
         let mut queued_actions = 0u64;
+        #[cfg(feature = "vita-profile")]
         let mut queued_profile = VitaQueuedActionProfile::default();
+        #[cfg(feature = "vita-profile")]
         let mut queued_opcode_profile = VitaAvm1ActionProfile::default();
         let rval = self.mutate_with_update_context(|context| {
             let rval = func(context);
 
+            #[cfg(feature = "vita-profile")]
+            {
             let actions_before = *context.avm1_action_count;
             let opcode_profile_before = *context.vita_avm1_action_profile;
             let begin = Instant::now();
@@ -2650,9 +2782,17 @@ impl Player {
             queued_actions = context.avm1_action_count.saturating_sub(actions_before);
             queued_opcode_profile =
                 (*context.vita_avm1_action_profile).saturating_sub(opcode_profile_before);
+            }
+
+            #[cfg(not(feature = "vita-profile"))]
+            {
+                Self::run_actions(context);
+            }
 
             rval
         });
+        #[cfg(feature = "vita-profile")]
+        {
         self.vita_frame_profile.queued_actions_us = self
             .vita_frame_profile
             .queued_actions_us
@@ -2679,15 +2819,21 @@ impl Player {
         self.vita_frame_profile.queued_predecode_pushes += queued_profile.predecode_pushes;
         self.vita_frame_profile.queued_predecode_parallel += queued_profile.predecode_parallel;
         self.vita_frame_profile.update_calls = self.vita_frame_profile.update_calls.saturating_add(1);
+        }
 
         // Update mouse state (check for new hovered button, etc.)
+        #[cfg(feature = "vita-profile")]
         let begin = Instant::now();
         self.mutate_with_update_context(|context| {
             Self::update_drag(context);
         });
+        #[cfg(feature = "vita-profile")]
         let drag_us = begin.elapsed().as_micros() as u64;
+        #[cfg(feature = "vita-profile")]
         let begin = Instant::now();
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        #[cfg(feature = "vita-profile")]
+        {
         let mouse_state_us = begin.elapsed().as_micros() as u64;
         self.vita_frame_profile.mouse_drag_us = self
             .vita_frame_profile
@@ -2701,14 +2847,7 @@ impl Player {
             .vita_frame_profile
             .mouse_us
             .saturating_add(drag_us.saturating_add(mouse_state_us));
-
-        // GC
-        let begin = Instant::now();
-        self.gc_arena.borrow_mut().collect_debt();
-        self.vita_frame_profile.gc_us = self
-            .vita_frame_profile
-            .gc_us
-            .saturating_add(begin.elapsed().as_micros() as u64);
+        }
 
         rval
     }
@@ -3386,6 +3525,8 @@ impl PlayerBuilder {
                     RunState::Suspended
                 },
                 needs_render: true,
+                #[cfg(target_os = "vita")]
+                vita_gc_tick_counter: 0,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
@@ -3412,6 +3553,17 @@ impl PlayerBuilder {
 
         // Finalize configuration and load the movie.
         let mut player_lock = player.lock().unwrap();
+
+        #[cfg(target_os = "vita")]
+        {
+            // Extended-memory Vita builds can trade a modestly larger live set
+            // for substantially fewer incremental trace cycles.
+            player_lock.gc_arena.borrow().metrics().set_pacing(Pacing {
+                sleep_factor: 2.0,
+                min_sleep: 2048,
+                ..Pacing::DEFAULT
+            });
+        }
 
         #[cfg(feature = "default_font")]
         if self.default_font {

@@ -19,6 +19,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "vita")]
 use std::ffi::c_void;
+#[cfg(target_os = "vita")]
+use std::sync::Arc;
 use swf::avm1::read::Reader;
 use tracing::instrument;
 
@@ -72,7 +74,24 @@ struct VitaPushStringKey {
 struct VitaFastActionCache {
     prepared_blocks: HashSet<VitaBlockKey>,
     push_lengths: HashMap<VitaPushKey, u16>,
+    ir_blocks: HashMap<VitaBlockKey, Arc<[VitaIrOp]>>,
 }
+
+#[cfg(target_os = "vita")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VitaIrOp {
+    /// Absolute byte offset inside the owning SWF movie.
+    pub offset: u32,
+    pub total_len: u32,
+    pub opcode: u8,
+    pub push_len: u16,
+    pub push_slot: u32,
+    pub constant_pool_slot: u32,
+    pub branch_target: u32,
+}
+
+#[cfg(target_os = "vita")]
+pub(crate) const VITA_IR_INVALID_SLOT: u32 = u32::MAX;
 
 #[cfg(target_os = "vita")]
 #[derive(Clone, Copy)]
@@ -93,6 +112,7 @@ struct VitaPushMeta {
 #[derive(Default)]
 struct VitaPredecodeOutput {
     pushes: Vec<VitaPushMeta>,
+    ops: Vec<VitaIrOp>,
 }
 
 #[cfg(target_os = "vita")]
@@ -232,6 +252,28 @@ unsafe extern "C" fn vita_predecode_worker(user: *mut c_void, begin: u32, end: u
                     });
                 }
             }
+            let action_offset = (task.data as usize + pos)
+                .saturating_sub(task.movie_base as usize);
+            output.ops.push(VitaIrOp {
+                offset: action_offset as u32,
+                total_len: total as u32,
+                opcode,
+                push_len: push_len.unwrap_or(0),
+                push_slot: VITA_IR_INVALID_SLOT,
+                constant_pool_slot: VITA_IR_INVALID_SLOT,
+                branch_target: if matches!(opcode, 0x99 | 0x9D) && total >= 5 {
+                    let delta = i16::from_le_bytes([bytes[pos + 3], bytes[pos + 4]]) as isize;
+                    let target = pos as isize + total as isize + delta;
+                    if target >= 0 && target <= task.len as isize {
+                        (task.data as usize + target as usize)
+                            .saturating_sub(task.movie_base as usize) as u32
+                    } else {
+                        VITA_IR_INVALID_SLOT
+                    }
+                } else {
+                    VITA_IR_INVALID_SLOT
+                },
+            });
             pos += total;
             if opcode == 0x00 {
                 break;
@@ -320,6 +362,12 @@ pub struct Avm1<'gc> {
     #[cfg(target_os = "vita")]
     vita_push_plans: HashMap<VitaPushKey, Vec<VitaPushOperand<'gc>>>,
 
+    #[cfg(target_os = "vita")]
+    vita_push_plan_slots: Vec<Option<Vec<VitaPushOperand<'gc>>>>,
+
+    #[cfg(target_os = "vita")]
+    vita_constant_pool_slots: Vec<Option<Gc<'gc, Vec<Value<'gc>>>>>,
+
     /// The list of all movie clips in execution order.
     clip_exec_list: Option<MovieClip<'gc>>,
 
@@ -365,6 +413,10 @@ impl<'gc> Avm1<'gc> {
             vita_push_strings: HashMap::new(),
             #[cfg(target_os = "vita")]
             vita_push_plans: HashMap::new(),
+            #[cfg(target_os = "vita")]
+            vita_push_plan_slots: Vec::new(),
+            #[cfg(target_os = "vita")]
+            vita_constant_pool_slots: Vec::new(),
             clip_exec_list: None,
 
             #[cfg(feature = "avm_debug")]
@@ -408,6 +460,7 @@ impl<'gc> Avm1<'gc> {
                 // A zero-payload Push still occupies 3 bytes, so this capacity
                 // is a hard upper bound and guarantees no worker-side realloc.
                 pushes: Vec::with_capacity(task.len / 3 + 1),
+                ops: Vec::with_capacity(task.len / 2 + 1),
             })
             .collect::<Vec<_>>();
         let mut predecode_context = VitaPredecodeContext {
@@ -439,9 +492,9 @@ impl<'gc> Avm1<'gc> {
         }
 
         let mut push_count = 0usize;
-        for (index, output) in outputs.into_iter().enumerate() {
+        for (index, mut output) in outputs.into_iter().enumerate() {
             let key = pending_keys[index];
-            for push in output.pushes {
+            for push in &output.pushes {
                 self.vita_fast_actions.push_lengths.insert(
                     VitaPushKey {
                         movie: key.movie,
@@ -451,10 +504,39 @@ impl<'gc> Avm1<'gc> {
                 );
                 push_count += 1;
             }
+            for op in &mut output.ops {
+                if op.opcode == 0x96 {
+                    op.push_slot = self.vita_push_plan_slots.len() as u32;
+                    self.vita_push_plan_slots.push(None);
+                } else if op.opcode == 0x88 {
+                    op.constant_pool_slot = self.vita_constant_pool_slots.len() as u32;
+                    self.vita_constant_pool_slots.push(None);
+                }
+            }
+            self.vita_fast_actions
+                .ir_blocks
+                .insert(key, Arc::from(output.ops));
             self.vita_fast_actions.prepared_blocks.insert(key);
         }
 
         (pending.len(), push_count, parallel)
+    }
+
+    #[cfg(target_os = "vita")]
+    pub(crate) fn vita_ir_block(&mut self, block: &SwfSlice) -> Arc<[VitaIrOp]> {
+        let key = VitaBlockKey {
+            movie: Arc::as_ptr(&block.movie) as usize,
+            start: block.start,
+            end: block.end,
+        };
+        if !self.vita_fast_actions.prepared_blocks.contains(&key) {
+            let _ = self.vita_predecode_blocks(std::slice::from_ref(block));
+        }
+        self.vita_fast_actions
+            .ir_blocks
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| Arc::from([]))
     }
 
     #[cfg(target_os = "vita")]
@@ -512,7 +594,7 @@ impl<'gc> Avm1<'gc> {
 
     #[cfg(target_os = "vita")]
     #[inline]
-    pub fn vita_push_plan(
+    pub(crate) fn vita_push_plan(
         &self,
         movie: usize,
         action_offset: usize,
@@ -527,7 +609,7 @@ impl<'gc> Avm1<'gc> {
 
     #[cfg(target_os = "vita")]
     #[inline]
-    pub fn vita_cache_push_plan(
+    pub(crate) fn vita_cache_push_plan(
         &mut self,
         movie: usize,
         action_offset: usize,
@@ -540,6 +622,46 @@ impl<'gc> Avm1<'gc> {
             },
             plan,
         );
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub(crate) fn vita_push_plan_slot(
+        &self,
+        slot: u32,
+    ) -> Option<smallvec::SmallVec<[VitaPushOperand<'gc>; 8]>> {
+        self.vita_push_plan_slots
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .map(|plan| smallvec::SmallVec::from_slice(plan))
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub(crate) fn vita_cache_push_plan_slot(&mut self, slot: u32, plan: Vec<VitaPushOperand<'gc>>) {
+        if let Some(entry) = self.vita_push_plan_slots.get_mut(slot as usize) {
+            *entry = Some(plan);
+        }
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub(crate) fn vita_constant_pool_slot(&self, slot: u32) -> Option<Gc<'gc, Vec<Value<'gc>>>> {
+        self.vita_constant_pool_slots
+            .get(slot as usize)
+            .and_then(|pool| *pool)
+    }
+
+    #[cfg(target_os = "vita")]
+    #[inline]
+    pub(crate) fn vita_cache_constant_pool_slot(
+        &mut self,
+        slot: u32,
+        pool: Gc<'gc, Vec<Value<'gc>>>,
+    ) {
+        if let Some(entry) = self.vita_constant_pool_slots.get_mut(slot as usize) {
+            *entry = Some(pool);
+        }
     }
 
     pub fn load_player_globals(context: &mut UpdateContext<'gc>) {

@@ -170,7 +170,8 @@ impl<'gc> TInteractiveObject<'gc> for LoaderDisplay<'gc> {
         point: Point<Twips>,
         require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
-        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
+        #[cfg(feature = "vita-profile")]
+        { *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1); }
         let mut options = HitTestOptions::SKIP_INVISIBLE;
         options.set(HitTestOptions::SKIP_MASK, self.maskee().is_none());
 

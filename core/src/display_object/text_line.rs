@@ -351,7 +351,10 @@ impl<'gc> TInteractiveObject<'gc> for TextLine<'gc> {
         _point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
-        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
+        #[cfg(not(feature = "vita-profile"))]
+        let _ = context;
+        #[cfg(feature = "vita-profile")]
+        { *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1); }
         None
     }
 
@@ -361,7 +364,10 @@ impl<'gc> TInteractiveObject<'gc> for TextLine<'gc> {
         _point: Point<Twips>,
         _require_button_mode: bool,
     ) -> Avm2MousePick<'gc> {
-        *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1);
+        #[cfg(not(feature = "vita-profile"))]
+        let _ = context;
+        #[cfg(feature = "vita-profile")]
+        { *context.vita_mouse_pick_tests = context.vita_mouse_pick_tests.saturating_add(1); }
         Avm2MousePick::Miss
     }
 
